@@ -5,7 +5,15 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
 RUN rustup target add wasm32-unknown-unknown
-RUN cargo install --locked --version 0.21.14 trunk
+# Install Trunk from the pre-built release tarball. Compiling Trunk from
+# source pulls in minify-html-common, which requires more memory than CI
+# provides and gets OOM-killed (SIGKILL) mid-build.
+RUN set -eux; \
+    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+      https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xzC /usr/local/bin; \
+    chmod +x /usr/local/bin/trunk; \
+    trunk --version
 # Pre-install the wasm-bindgen CLI that matches the version our Cargo.lock
 # resolves to. Keeping this in sync with the library version is required —
 # Trunk would otherwise try to download the musl binary from GitHub Releases,
