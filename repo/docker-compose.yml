@@ -1,0 +1,130 @@
+version: "3.9"
+
+# FieldOps Kitchen & Training Console
+# ALL environment variables live in this file.
+# The backend reads these ONLY via the backend/config module.
+#
+# ⚠️  DEVELOPMENT DEFAULTS ONLY.
+# The values below (JWT_SECRET, AES_256_KEY_HEX, DEFAULT_ADMIN_PASSWORD) are
+# known placeholders. They are accepted ONLY because DEV_MODE=true is set
+# below. For a real deployment you MUST:
+#   1. Set DEV_MODE=false (or remove it),
+#   2. Replace JWT_SECRET / AES_256_KEY_HEX / DEFAULT_ADMIN_PASSWORD with
+#      securely generated values — otherwise startup hard-fails with
+#      "insecure placeholder detected",
+#   3. Keep REQUIRE_ADMIN_PASSWORD_CHANGE=true so the seeded admin must rotate
+#      their password on first login.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fieldops_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fieldops
+      POSTGRES_PASSWORD: fieldops_pw
+      POSTGRES_DB: fieldops
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fieldops -d fieldops"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fieldops_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- Database ---
+      DATABASE_URL: postgres://fieldops:fieldops_pw@postgres:5432/fieldops
+      DATABASE_MAX_CONNECTIONS: "10"
+
+      # --- HTTP server ---
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8080"
+      ENABLE_TLS: "false"
+      TLS_CERT_PATH: ""
+      TLS_KEY_PATH: ""
+
+      # --- Auth ---
+      JWT_SECRET: dev-jwt-secret-change-in-prod-0123456789abcdef
+      JWT_EXPIRY_HOURS: "24"
+      ARGON2_MEMORY_KIB: "19456"
+      ARGON2_ITERATIONS: "2"
+      ARGON2_PARALLELISM: "1"
+
+      # --- Encryption (AES-256 key, 32-byte hex) ---
+      AES_256_KEY_HEX: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+      # --- Logging ---
+      LOG_LEVEL: info
+      LOG_FORMAT: structured
+
+      # --- Business rules ---
+      SYNC_INTERVAL_MINUTES: "10"
+      DEFAULT_SERVICE_RADIUS_MILES: "30"
+      MAX_NOTIFICATIONS_PER_HOUR: "20"
+      MAX_VERSIONS_PER_PROGRESS: "30"
+      SOFT_DELETE_RETENTION_DAYS: "90"
+      SLA_ALERT_THRESHOLDS: "0.75,0.90,1.00"
+      NOTIFICATION_RETRY_MAX_ATTEMPTS: "5"
+      NOTIFICATION_RETRY_BASE_SECONDS: "1"
+      ON_CALL_HIGH_PRIORITY_HOURS: "4"
+
+      # --- App behavior ---
+      RUN_MIGRATIONS_ON_BOOT: "true"
+      SEED_DEFAULT_ADMIN: "true"
+      DEFAULT_ADMIN_USERNAME: admin
+      DEFAULT_ADMIN_PASSWORD: admin123
+
+      # --- Security gating ---
+      # DEV_MODE=true permits the dev-only placeholder secrets above. Set to
+      # "false" in production: startup will then refuse to boot with any known
+      # placeholder value for JWT_SECRET / AES_256_KEY_HEX / DEFAULT_ADMIN_PASSWORD.
+      DEV_MODE: "true"
+      REQUIRE_ADMIN_PASSWORD_CHANGE: "true"
+    ports:
+      - "8080:8080"
+
+  # Test runner — uses the builder stage of the backend Dockerfile (has cargo
+  # + full source tree) instead of the slim runtime image. Only activated when
+  # `--profile tests` is passed to `docker compose`.
+  backend-test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder
+    profiles: ["tests"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://fieldops:fieldops_pw@postgres:5432/fieldops
+      RUST_BACKTRACE: "1"
+    working_dir: /app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fieldops_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: http://backend:8080
+      PUBLIC_API_BASE: http://localhost:8080
+    ports:
+      - "8081:80"
+
+volumes:
+  pg_data:

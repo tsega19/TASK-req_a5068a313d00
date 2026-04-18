@@ -1,0 +1,10 @@
+target/
+**/*.rs.bk
+Cargo.lock
+node_modules/
+.venv/
+dist/
+*.log
+.DS_Store
+/.claude
+../.claude

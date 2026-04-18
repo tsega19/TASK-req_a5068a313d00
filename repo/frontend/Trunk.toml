@@ -1,0 +1,11 @@
+[build]
+target = "index.html"
+release = true
+dist = "dist"
+
+# No [tools] pin — Trunk downloads the wasm-bindgen-cli version that matches
+# the schema embedded in the compiled WASM, sidestepping version drift.
+
+[serve]
+addresses = ["0.0.0.0"]
+port = 8082

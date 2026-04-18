@@ -1,0 +1,54 @@
+[package]
+name = "fieldops_frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yew = { version = "0.21", features = ["csr"] }
+yew-router = "0.18"
+# Pin exactly: the Dockerfile also installs wasm-bindgen-cli at this exact
+# version. Loose `0.2` picks up new minors (e.g. 0.2.118) whose CLI would then
+# need a separate pin to match — simpler to fix both here.
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "0.4"
+gloo-net = "0.5"
+gloo-storage = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-events = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "HtmlAnchorElement",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "AudioContext",
+    "BaseAudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "OscillatorNode",
+    "OscillatorType",
+    "GainNode",
+    "Navigator",
+    "Window",
+    "Storage",
+    "console",
+    "Geolocation",
+    "Position",
+    "PositionOptions",
+    "PositionError",
+    "Coordinates",
+]}
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
