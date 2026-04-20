@@ -20,6 +20,8 @@ fn make(role: Role) -> AuthedUser {
         branch_id: None,
         iat: 0,
         exp: i64::MAX / 2, // not expired
+        iss: "fieldops-test".into(),
+        aud: "fieldops-test".into(),
     })
 }
 
@@ -121,6 +123,8 @@ fn authed_user_accessors_surface_claim_fields() {
         branch_id: Some(branch),
         iat: 0,
         exp: i64::MAX / 2,
+        iss: "fieldops-test".into(),
+        aud: "fieldops-test".into(),
     });
     assert_eq!(u.user_id(), sub);
     assert_eq!(u.role(), Role::Super);

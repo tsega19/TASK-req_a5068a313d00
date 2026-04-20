@@ -1,300 +1,187 @@
-# FieldOps Kitchen & Training Console — Delivery Acceptance & Architecture Audit (Static-Only)
-
-Date: 2026-04-18  
-Reviewer mode: static-only (no execution, no Docker, no tests run)
-
----
+# Delivery Acceptance and Project Architecture Static Audit
 
 ## 1. Verdict
-
-**Overall conclusion: Fail**
-
-Primary reasons (static-evidenced):
-- Core technician workflow cannot complete required state transitions from the UI because the frontend does not provide required GPS/check-in data and uses placeholder behaviors. (`repo/frontend/src/pages/work_order_detail.rs:226`, `repo/backend/src/state_machine.rs:62`)
 - “Recipe” timers are not actually sourced from backend configuration; the UI renders preview timers and does not persist timer state. (`repo/frontend/src/pages/recipe_step.rs:96`, `repo/frontend/src/pages/recipe_step.rs:186`)
 - High-risk security defaults are shipped as documented defaults (admin/admin123, hardcoded JWT secret & AES key in compose). (`repo/README.md:31`, `repo/docker-compose.yml:48`, `repo/docker-compose.yml:55`, `repo/docker-compose.yml:76`)
 
 ---
 
 ## 2. Scope and Static Verification Boundary
-
-### What was reviewed (static)
 - Root docs and orchestration: `repo/README.md`, `repo/docker-compose.yml`, `repo/run_tests.sh`
 - Backend (Actix-web): wiring, middleware, auth, RBAC, domain routes, migrations, logging, tests
 - Frontend (Yew): routing and main pages relevant to the Prompt flows (work orders, recipe steps, map/trail, analytics)
 
-### What was not reviewed
-- Any runtime behavior (no containers, no DB actually started, no browser UI run)
-- Performance, load behavior, real network/offline conditions, and actual tablet rendering
-
-### What was intentionally not executed
-- `docker compose …` (`repo/README.md:8`)
-- `./run_tests.sh` (script runs Docker + curl) (`repo/run_tests.sh:1`)
-
-### Claims requiring manual verification
-- Any “offline-first” sync behavior across replicas/devices (server-side code explicitly calls transport out-of-scope) (`repo/backend/src/sync/mod.rs:5`)
-- UI/UX quality on a tablet (touch target sizes, layout, reminders), audible alarms in real browsers, and Nginx proxy behavior
-
----
+- **Reviewed:** repository structure, README/run docs, backend Actix entrypoints and route registration, config/migrations, auth/RBAC/object-scope logic, sync/merge/retention/notifications/analytics modules, frontend Yew pages/components/routes, and backend/frontend test suites.
+- **Not reviewed:** runtime behavior in browser/server, container orchestration health, actual DB migration execution results, real network/offline conditions, audio/device geolocation behavior in live browsers.
+- **Intentionally not executed:** project startup, Docker, tests, external services.
+- **Manual verification required for:** real offline resilience under connectivity flaps, browser audio reminder audibility, map rendering/geolocation permissions across target tablets, CSV download UX across browsers.
 
 ## 3. Repository / Requirement Mapping Summary
-
-### Prompt core business goal (extracted)
-- Tablet-optimized technician console to execute standardized work orders via step-by-step “recipe” workflow with **multiple concurrent timers** and reminders; steps can be paused/resumed without losing timers/notes.
-- Work order lifecycle as a **state machine** with required fields per transition; arrival/departure check-ins enforced; in-app alerts.
-- Map-style view: job location + technician trajectory; privacy mode reduces precision and hides trail from non-admin users.
-- Learning analytics (role-filtered) and CSV export with watermarking.
-- Backend: Actix-web REST APIs + PostgreSQL persistence; auditing/immutable logs; scheduled sync every 10 minutes with ETag-style hashes, soft deletes, version retention, deterministic merge policy.
-- Security: local username/password (salted hashing), encryption-at-rest for sensitive fields, role-based access control and data isolation.
-
-### Implementation areas mapped
-- Backend route registration in `repo/backend/src/lib.rs` and `repo/backend/src/work_orders/routes.rs`
-- Auth/JWT + middleware in `repo/backend/src/auth/*` and `repo/backend/src/middleware/rbac.rs`
-- State machine in `repo/backend/src/state_machine.rs`
-- Location trail + privacy in `repo/backend/src/location/routes.rs` and frontend map page `repo/frontend/src/pages/map_view.rs`
-- Analytics and CSV export in `repo/backend/src/analytics/routes.rs` and `repo/frontend/src/pages/analytics.rs`
-- Tests in `repo/backend/tests/*` and frontend e2e script `repo/frontend/tests/e2e/smoke.sh`
-
----
+- **Prompt core goal mapped:** technician work-order execution + guided recipe flow + timer/tip/location/privacy + learning analytics + offline-first sync + immutable logs + security.
+- **Main implementation areas mapped:**
+  - Backend: `backend/src/{work_orders,recipes,location,learning,analytics,notifications,sync,auth,admin,me}` + migrations.
+  - Frontend: `frontend/src/pages/*`, timer/map/nav/offline components, API client.
+  - Tests: extensive backend unit/API tests in `backend/tests`, lightweight frontend e2e smoke only.
 
 ## 4. Section-by-section Review
 
 ### 1. Hard Gates
-
 #### 1.1 Documentation and static verifiability
+- **Conclusion: Pass**
+- **Rationale:** Clear startup/test docs, port mappings, and security configuration guidance are present and consistent with code/config.
+- **Evidence:** `README.md:5-25`, `README.md:50-83`, `docker-compose.yml:37-132`, `backend/src/main.rs:14-51`.
+
+#### 1.2 Material deviation from Prompt
 - **Conclusion: Partial Pass**
-- **Rationale:** Startup/test commands exist, but the docs are “Docker-only” and do not document non-Docker local workflows (may be acceptable), and do not document key business flows (check-ins, timers, sync conflict review) beyond stating defaults.
-- **Evidence:** `repo/README.md:8`, `repo/run_tests.sh:1`, `repo/docker-compose.yml:6`
-- **Manual verification:** Required for full-stack behavior, Nginx proxying, and any DB initialization success.
-
-#### 1.2 Material deviation from the Prompt
-- **Conclusion: Fail**
-- **Rationale:** Multiple prompt-critical requirements are implemented as placeholders or “skeleton/out-of-scope” logic:
-  - Frontend does not supply required data to perform core state transitions (GPS/check-ins), so technician lifecycle is blocked.
-  - Step timers are not backend-defined; frontend renders preview timers and does not persist timer state snapshots.
-  - Sync is explicitly described as lacking the replica transport and merge policy layer.
-- **Evidence:** `repo/frontend/src/pages/work_order_detail.rs:226`, `repo/backend/src/state_machine.rs:62`, `repo/frontend/src/pages/recipe_step.rs:96`, `repo/backend/src/sync/mod.rs:5`
-- **Manual verification:** Not applicable; these are static gaps/deviations.
-
----
+- **Rationale:** Core domain is implemented, but several explicit Prompt requirements are not fully delivered in the user-facing product (notably offline-first behavior in UI and analytics access/filtering requirements).
+- **Evidence:** `frontend/src/offline.rs:332-383`, `frontend/src/pages/dashboard.rs:29-33`, `frontend/src/pages/work_order_detail.rs:45-67`, `frontend/src/pages/analytics.rs:13-17`, `frontend/src/components/nav.rs:36-38`, `frontend/src/pages/analytics.rs:33-52`.
 
 ### 2. Delivery Completeness
-
 #### 2.1 Core requirements coverage
 - **Conclusion: Partial Pass**
-- **Rationale:** Some major areas exist (work orders, recipes/steps, tip cards, location trail, analytics export), but several explicit core requirements are missing or only stubbed:
-  - Multi-timer persistence across pause/resume is not implemented end-to-end (timer state snapshot exists in DB model, but frontend sends `timer_state: null` and renders preview timers).
-  - Arrival/departure check-ins are enforced in backend logic but not surfaced as a complete UI flow.
-  - Offline ZIP+4 + street index is represented by a deterministic hash-based stub, not a bundled index.
-  - Sync conflict deterministic merge policy is not implemented (only conflict counting/reporting and etag logging).
-- **Evidence:** `repo/frontend/src/pages/recipe_step.rs:96`, `repo/frontend/src/pages/work_order_detail.rs:226`, `repo/backend/src/location/geocode_stub.rs:4`, `repo/backend/src/sync/mod.rs:5`
-- **Manual verification:** Not sufficient to resolve these; they are primarily implementation gaps.
+- **Rationale:** Many core features exist (state machine, timers, tip cards, check-ins, privacy masking, sync merge policy, retention, analytics export watermark), but some explicit requirements are incompletely surfaced to end users.
+- **Evidence:**
+  - Implemented: `backend/src/state_machine.rs:23-115`, `backend/src/work_orders/progress.rs:66-231`, `backend/src/location/routes.rs:66-268`, `backend/src/sync/merge.rs:69-309`, `backend/src/analytics/routes.rs:123-177`.
+  - Gaps: `frontend/src/pages/analytics.rs:13-17`, `frontend/src/pages/analytics.rs:33-52`, `frontend/src/offline.rs:332-383` + no usages outside module.
 
-#### 2.2 End-to-end 0→1 deliverable vs partial/demo
+#### 2.2 End-to-end 0?1 deliverable
 - **Conclusion: Partial Pass**
-- **Rationale:** Repo contains full-stack structure, migrations, and an integration-test harness. However, key business flows appear “demo-like” (synthetic trail capture, preview timers, explicit “out-of-scope” sync transport).
-- **Evidence:** `repo/frontend/src/pages/map_view.rs:94`, `repo/frontend/src/pages/recipe_step.rs:186`, `repo/backend/src/sync/mod.rs:5`
-
----
+- **Rationale:** Full project structure exists with backend+frontend and tests; however frontend relies on direct online API calls for core flows instead of offline queue/cache wrappers, weakening the promised offline-first end-to-end behavior.
+- **Evidence:** `backend/src/lib.rs:41-57`, `frontend/src/pages/*.rs` (direct `api::get/post/put`), `frontend/src/offline.rs:332-383`, `run_tests.sh:49-89`.
 
 ### 3. Engineering and Architecture Quality
-
 #### 3.1 Structure and decomposition
 - **Conclusion: Pass**
-- **Rationale:** Backend is decomposed into modules aligned to domain areas; route wiring centralized in `configure`. Frontend has pages/components separation.
-- **Evidence:** `repo/backend/src/lib.rs:26`, `repo/frontend/src/routes.rs:4`
+- **Rationale:** Backend and frontend are modular with clear bounded contexts and shared route wiring; no major single-file collapse.
+- **Evidence:** `backend/src/lib.rs:12-34`, `backend/src/lib.rs:41-57`, `frontend/src/app.rs:159-178`, folder layout from `rg --files`.
 
-#### 3.2 Maintainability and extensibility
+#### 3.2 Maintainability/extensibility
 - **Conclusion: Partial Pass**
-- **Rationale:** Many modules are structured for extension (RBAC helpers, config module, logging macros), but critical prompt features are “stubbed” in ways that would require non-trivial refactors (timers API surface, sync transport/merge policy, geocode/index bundling).
-- **Evidence:** `repo/backend/src/middleware/rbac.rs:1`, `repo/backend/src/sync/mod.rs:5`, `repo/frontend/src/pages/recipe_step.rs:96`
-
----
+- **Rationale:** Core architecture is extensible, but there is a maintainability gap where dedicated offline abstractions exist but are not integrated into feature pages, creating architectural drift between intended and actual behavior.
+- **Evidence:** `frontend/src/offline.rs:332-383` vs `frontend/src/pages/dashboard.rs:29-33`, `frontend/src/pages/recipe_step.rs:182`, `frontend/src/pages/map_view.rs:170`, `frontend/src/pages/notifications.rs:26-28`.
 
 ### 4. Engineering Details and Professionalism
-
 #### 4.1 Error handling, logging, validation, API design
 - **Conclusion: Partial Pass**
-- **Rationale:** Central `ApiError` exists, standardized JSON error body exists, request logging middleware exists, and redaction is implemented. However:
-  - The delivered `docker-compose.yml` ships hardcoded secrets and default admin credentials, which is unsafe even for a demo if not clearly gated.
-  - Several routes appear to be “best-effort” on security/validation (e.g., arrival radius check falls back to “true” when branch coordinates missing, weakening the rule).
-- **Evidence:** `repo/backend/src/errors.rs:1`, `repo/backend/logging/mod.rs:1`, `repo/docker-compose.yml:48`, `repo/backend/src/work_orders/routes.rs:307`
-- **Manual verification:** Whether secrets are overridden in real deployments.
+- **Rationale:** Strong validation and structured logging are broadly present; however audit requirement �every transition and user action writes immutable processing log� is not consistently met for some user actions (example: logout).
+- **Evidence:**
+  - Strong: `backend/src/errors.rs` (global API errors), `backend/src/logging/mod.rs:57-91`, `backend/src/work_orders/routes.rs:321-407`.
+  - Gap: `backend/src/auth/routes.rs:110-118` (logout returns success with no `processing_log::record_tx` call).
 
-#### 4.2 Organized like a real product/service vs demo
-- **Conclusion: Partial Pass**
-- **Rationale:** DB migrations and module separation look product-like, but core UX flows still contain explicit preview/synthetic behavior.
-- **Evidence:** `repo/backend/migrations/0001_init.sql:1`, `repo/frontend/src/pages/recipe_step.rs:186`, `repo/frontend/src/pages/map_view.rs:94`
-
----
+#### 4.2 Real product vs demo shape
+- **Conclusion: Pass**
+- **Rationale:** Full-stack service with RBAC, migrations, scheduled workers, sync/conflict handling, analytics export, and broad API tests resembles product-grade delivery.
+- **Evidence:** `backend/src/main.rs:31-35`, `backend/migrations/0001_init.sql:51-322`, `backend/tests/api.rs:1-38`, `backend/tests/unit.rs:1-15`.
 
 ### 5. Prompt Understanding and Requirement Fit
-
-#### 5.1 Correct semantics and implicit constraints
+#### 5.1 Business objective and constraints fit
 - **Conclusion: Partial Pass**
-- **Rationale:** State machine states match the Prompt and PRD, and the backend enforces key gates (notes required for certain transitions; step completion gate; check-in gate). However, multiple key semantics are not implemented end-to-end in the UI and sync layer.
-- **Evidence:** `repo/backend/src/enums.rs:20`, `repo/backend/src/state_machine.rs:62`, `repo/frontend/src/pages/work_order_detail.rs:226`
+- **Rationale:** Overall understanding is strong, but explicit requirement fit is incomplete in two key places: technicians seeing own analytics and frontend branch filtering for analytics; offline-first behavior is also not wired into core UI flows.
+- **Evidence:** `frontend/src/pages/analytics.rs:13-17`, `frontend/src/components/nav.rs:36-38`, `frontend/src/pages/analytics.rs:33-52`, `frontend/src/offline.rs:332-383` and no callers.
 
----
-
-### 6. Aesthetics (frontend-only / full-stack tasks only)
-
-#### 6.1 Visual and interaction quality
-- **Conclusion: Cannot Confirm Statistically**
-- **Rationale:** Static code suggests a card/stack UI pattern and custom components (timer rings, badges), but actual rendering, spacing, touch target sizing, and usability cannot be validated without running in a browser/tablet.
-- **Evidence:** `repo/frontend/src/pages/recipe_step.rs:1`, `repo/frontend/src/components/timer_ring.rs:1`
-- **Manual verification:** Run on a tablet-sized viewport; verify touch targets (≥44×44), reminders, and navigation flows.
-
----
+### 6. Aesthetics (frontend)
+#### 6.1 Visual/interaction quality
+- **Conclusion: Pass (Static Evidence)**
+- **Rationale:** CSS provides coherent visual hierarchy, responsive behavior, touch-target sizing, hover/active affordances, badges, and loading feedback.
+- **Evidence:** `frontend/styles/main.css:1-347`, `frontend/src/components/loading_button.rs` (loading affordance), `frontend/src/components/state_badge.rs`.
+- **Manual verification note:** live rendering quality and tablet ergonomics still require manual visual QA.
 
 ## 5. Issues / Suggestions (Severity-Rated)
 
-### Blocker
-
-1) **Blocker — Technician state transitions are blocked from UI (missing required GPS/check-in inputs)**
+### Blocker / High
+1. **Severity: High**
+- **Title:** Offline-first requirement is not integrated into core frontend flows
 - **Conclusion:** Fail
-- **Evidence:** `repo/frontend/src/pages/work_order_detail.rs:226`, `repo/backend/src/state_machine.rs:62`
-- **Impact:** Core technician lifecycle cannot progress; “Scheduled → En Route” requires `lat/lng`, but frontend sends `None` values, leading to a 400/blocked transition.
-- **Minimum actionable fix:** Implement geolocation capture (or explicit user-entered coordinates) in the transition UI and wire arrival/departure check-in actions before allowing the transitions that require them.
+- **Evidence:** Offline abstraction exists in `frontend/src/offline.rs:332-383`, but feature pages call direct network APIs (`frontend/src/pages/dashboard.rs:29-33`, `frontend/src/pages/work_order_detail.rs:45-67`, `frontend/src/pages/recipe_step.rs:182`, `frontend/src/pages/map_view.rs:170`, `frontend/src/pages/notifications.rs:26-28`).
+- **Impact:** Core technician workflows can fail hard when offline instead of caching GETs / queueing mutations as required.
+- **Minimum actionable fix:** Replace core page `api::get/post/put/delete` calls with `offline::get_cached` and `offline::mutate_with_queue` (or unify through an offline-aware API layer).
 
-2) **Blocker — Multi-concurrent timers are not backend-defined and timer persistence is not implemented end-to-end**
+2. **Severity: High**
+- **Title:** Technicians are blocked from viewing their own learning analytics in UI
 - **Conclusion:** Fail
-- **Evidence:** `repo/frontend/src/pages/recipe_step.rs:96`, `repo/frontend/src/pages/recipe_step.rs:186`
-- **Impact:** Prompt requires multiple concurrent timers per step with pause/resume and persistence; current UI uses preview timers and submits `timer_state: null`, so timers cannot be restored deterministically after pause/resume.
-- **Minimum actionable fix:** Add backend API to list timers per step (e.g., `GET /api/steps/{step_id}/timers` from `step_timers`), return timer definitions as part of step/recipe payload, and persist/restore timer state snapshots via `job_step_progress.timer_state_snapshot`.
+- **Evidence:** `frontend/src/pages/analytics.rs:13-17` restricts page to SUPER/ADMIN; nav link also limited in `frontend/src/components/nav.rs:36-38`. Backend supports TECH-scoped analytics (`backend/src/analytics/routes.rs:66-70`).
+- **Impact:** Violates explicit requirement that technicians can see their own results.
+- **Minimum actionable fix:** Allow TECH role in analytics route/nav and keep backend scope as-is.
 
-### High
-
-3) **High — Shipped default credentials and hardcoded secrets in compose**
-- **Conclusion:** Fail (security hard gate for many audits)
-- **Evidence:** `repo/README.md:31`, `repo/docker-compose.yml:48`, `repo/docker-compose.yml:55`, `repo/docker-compose.yml:76`
-- **Impact:** Anyone with access to the running service can trivially authenticate as admin. Hardcoded JWT secret and AES key undermine authentication and any “encryption at rest” semantics.
-- **Minimum actionable fix:** Remove fixed defaults (or gate them behind an explicit `DEV_MODE=true`), require secrets via environment injection, enforce password change/rotation on first boot, and refuse startup if secrets are known placeholders.
-
-4) **High — “Encryption at rest” for home addresses is not implemented beyond schema**
-- **Conclusion:** Partial / likely missing
-- **Evidence:** `repo/backend/migrations/0001_init.sql:70`, `repo/backend/config/mod.rs:132`
-- **Impact:** Prompt requires sensitive fields encrypted at rest. Schema includes `home_address_enc` but there is no statically-evidenced encrypt/decrypt layer or API path to write/read this field securely.
-- **Minimum actionable fix:** Implement an encryption module using the configured AES key, integrate it into user create/update/read paths, and add tests to verify ciphertext storage and authorized plaintext access only.
+3. **Severity: High**
+- **Title:** Analytics branch filter requirement is not delivered in frontend
+- **Conclusion:** Partial Fail
+- **Evidence:** Prompt-required branch filter not present in analytics UI/query builder (`frontend/src/pages/analytics.rs:33-52`, controls `:137-150` show from/to/role only). Backend supports `branch` query (`backend/src/analytics/routes.rs:26`, `72-77`, `94`).
+- **Impact:** Supervisors/admins cannot perform required branch-filtered reporting from delivered UI.
+- **Minimum actionable fix:** Add branch selector/input in analytics page and include `branch=<uuid>` in query string.
 
 ### Medium
+4. **Severity: Medium**
+- **Title:** Processing log coverage does not include all user actions (example: logout)
+- **Conclusion:** Partial Fail
+- **Evidence:** Logout endpoint has no immutable audit write (`backend/src/auth/routes.rs:110-118`), while prompt calls for every transition and user action in immutable processing log.
+- **Impact:** Audit trail can be incomplete for security/compliance investigations.
+- **Minimum actionable fix:** Add `processing_log::record_tx` for logout and define clear policy for which user actions must be logged.
 
-5) **Medium — Sync engine explicitly omits replica transport + deterministic merge policy**
-- **Conclusion:** Partial / out-of-scope skeleton
-- **Evidence:** `repo/backend/src/sync/mod.rs:5`
-- **Impact:** Prompt specifies scheduled replica sync, soft deletes retention, version retention, and deterministic merge policy that never overwrites completed logs and can force supervisor review. Current implementation is primarily change-tracking and conflict counting; it does not implement the key cross-replica behavior.
-- **Minimum actionable fix:** Define sync protocol + endpoints, implement merge rules and conflict detection for step notes/timer snapshots, and add integration tests that simulate conflicting edits.
-
-6) **Medium — Offline ZIP+4 + street index is represented as a hash-based stub, not a bundled index**
-- **Conclusion:** Partial
-- **Evidence:** `repo/backend/src/location/geocode_stub.rs:4`
-- **Impact:** Prompt requires offline normalization/geocoding via bundled index; hashing does not validate real addresses, ZIP+4, or service-radius by address.
-- **Minimum actionable fix:** Bundle a real offline dataset (even a small sample) and implement deterministic lookup/normalization against it; document dataset placement and update strategy.
+5. **Severity: Medium**
+- **Title:** Frontend admin user-form password rule conflicts with backend rule
+- **Conclusion:** Partial Fail
+- **Evidence:** Frontend allows `>=4` chars (`frontend/src/pages/admin.rs:85-87`), backend enforces `>=12` (`backend/src/admin/routes.rs:84-87`).
+- **Impact:** Predictable failed submissions and operator confusion.
+- **Minimum actionable fix:** Align frontend validation to backend minimum 12 chars.
 
 ### Low
-
-7) **Low — README encourages Docker-only usage and documents a seeded admin password**
-- **Conclusion:** Acceptable for a dev demo, but risky for acceptance
-- **Evidence:** `repo/README.md:31`
-- **Impact:** Encourages insecure defaults in real deployments; also reduces reviewer’s ability to verify without Docker if Docker is unavailable.
-- **Minimum actionable fix:** Add explicit “development-only defaults” warnings and document secure production configuration.
-
----
+6. **Severity: Low**
+- **Title:** Frontend �unit tests� are documentation-only; no actual frontend unit suite
+- **Conclusion:** Partial Fail
+- **Evidence:** `frontend/tests/unit/README.md:1-22` describes approach but includes no executable unit tests.
+- **Impact:** Client-only logic regressions may rely solely on e2e smoke detection.
+- **Minimum actionable fix:** Add wasm-bindgen unit tests for key pure UI logic/state transitions.
 
 ## 6. Security Review Summary
-
-### Authentication entry points
-- **Conclusion: Pass (with unsafe defaults)**
-- **Evidence:** `repo/backend/src/auth/routes.rs:1`, `repo/backend/src/middleware/rbac.rs:55`
-- **Reasoning:** JWT login exists and middleware enforces bearer tokens for non-public routes; however, default admin credentials and hardcoded secrets are a high-risk delivery issue.
-
-### Route-level authorization
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/src/middleware/rbac.rs:148`, `repo/backend/src/admin/routes.rs:8`
-- **Reasoning:** Many handlers explicitly call `require_role`/`require_any_role`, but this is not uniformly guaranteed by the type system; enforcement relies on per-handler discipline.
-
-### Object-level authorization
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/src/work_orders/routes.rs:477`, `repo/backend/src/notifications/routes.rs:33`
-- **Reasoning:** Work order visibility is filtered by role/ownership/branch and returns 404 on non-visible resources; notifications are scoped by `user_id`. Requires deeper audit for every endpoint; current sample is good but not comprehensive.
-
-### Function-level authorization
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/src/admin/routes.rs:41`
-- **Reasoning:** Admin actions check role in each handler; similar checks exist for SUPER-only actions (on-call queue). Not all privileged operations have dedicated guard abstractions beyond helper functions.
-
-### Tenant / user data isolation
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/src/work_orders/routes.rs:23`, `repo/backend/src/analytics/routes.rs:68`
-- **Reasoning:** Role scoping is applied to work orders and analytics queries. Full coverage depends on ensuring every query is scoped correctly (manual review required for completeness).
-
-### Admin / internal / debug endpoint protection
-- **Conclusion: Pass**
-- **Evidence:** `repo/backend/src/admin/routes.rs:8`
-- **Reasoning:** Admin scope enforces `Role::Admin` in handlers; no obvious debug endpoints were found in the reviewed static scope.
-
----
+- **Authentication entry points:** **Pass**. JWT issue/verify with issuer/audience enforcement and password hashing present. Evidence: `backend/src/auth/routes.rs:48-107`, `backend/src/auth/jwt.rs:59-75`, `backend/src/auth/hashing.rs:21-36`.
+- **Route-level authorization:** **Pass**. Middleware requires bearer for non-public routes; per-handler role checks are common. Evidence: `backend/src/middleware/rbac.rs:97-133`, `229-251`; examples `backend/src/admin/routes.rs:51`, `79`, `137`.
+- **Object-level authorization:** **Pass**. Work-order visibility helper and per-owner checks implemented with 404 anti-enumeration. Evidence: `backend/src/work_orders/routes.rs:550-576`, `323-326`; `backend/src/location/routes.rs:74-81`, `207-209`; `backend/src/learning/routes.rs:473-489`.
+- **Function-level authorization:** **Pass**. Sensitive operations enforce role checks inside handlers. Evidence: `backend/src/sync/routes.rs:85`, `111`, `296`; `backend/src/recipes/routes.rs:169`, `213`.
+- **Tenant / user isolation:** **Partial Pass**. Strong per-user/per-branch scoping in major modules, but some global feeds (e.g., recipes/tip-card change feed exposure to TECH via sync changes) may be broader than strict least-privilege depending on business policy. Evidence: `backend/src/sync/routes.rs:226-235`.
+- **Admin/internal/debug protection:** **Pass**. Admin scopes are protected with admin-only checks. Evidence: `backend/src/admin/routes.rs:493-507` plus handler-level `require_role` calls.
 
 ## 7. Tests and Logging Review
-
-### Unit tests
-- **Conclusion: Pass**
-- **Evidence:** `repo/backend/tests/unit/pagination.rs:1`, `repo/backend/tests/unit/sync_conflicts.rs:1`
-
-### API / integration tests
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/tests/api/auth.rs:1`, `repo/backend/tests/api/work_orders.rs:1`
-- **Rationale:** Coverage exists for auth, RBAC, work orders, and some sync behavior. It does not cover end-to-end technician UI flows, timers persistence, or conflict merge policy.
-
-### Logging categories / observability
-- **Conclusion: Pass**
-- **Evidence:** `repo/backend/logging/mod.rs:1`, `repo/backend/src/middleware/request_log.rs:1`
-
-### Sensitive-data leakage risk in logs / responses
-- **Conclusion: Partial Pass**
-- **Evidence:** `repo/backend/logging/mod.rs:41`, `repo/backend/src/auth/routes.rs:57`
-- **Rationale:** Redaction exists for common patterns; password hash is skipped in `UserRow` serialization. Remaining risk: user-controlled strings can still be logged (e.g., username) and redaction is regex-based, so completeness is not provable statically.
-
----
+- **Unit tests:** **Pass (backend)**. Extensive unit coverage for state machine, crypto, RBAC guards, sync merge. Evidence: `backend/tests/unit.rs:1-15`, `backend/tests/unit/state_machine.rs`, `backend/tests/unit/crypto.rs`, `backend/tests/unit/sync_conflicts.rs`.
+- **API/integration tests:** **Pass (backend), Partial (frontend)**. Backend has broad API tests; frontend has smoke script only. Evidence: `backend/tests/api.rs:1-38`, `backend/tests/api/*.rs`; `frontend/tests/e2e/smoke.sh:1-75`, `frontend/tests/unit/README.md:1-22`.
+- **Logging categories/observability:** **Pass**. Structured tagged logging with redaction and request logs present. Evidence: `backend/logging/mod.rs:13-47`, `57-91`; `backend/src/middleware/request_log.rs:61-75`.
+- **Sensitive-data leakage risk in logs/responses:** **Partial Pass**. Password hash omitted from serialized `UserRow`; redaction exists. Home address plaintext is returned to authenticated owner by design. Evidence: `backend/src/auth/models.rs:44-45`, `backend/logging/mod.rs:15-18`, `backend/src/me/routes.rs:133-136`.
 
 ## 8. Test Coverage Assessment (Static Audit)
 
 ### 8.1 Test Overview
-- Unit tests exist (Rust `#[test]` and `#[actix_web::test]`): `repo/backend/tests/unit/*` (`repo/backend/tests/unit/pagination.rs:1`)
-- API/integration tests exist (Actix test harness + real DB): `repo/backend/tests/api/*` (`repo/backend/tests/api/auth.rs:1`)
-- Test entry point is Docker-centric: `repo/run_tests.sh` invokes `docker compose … cargo test` (`repo/run_tests.sh:34`)
-- Frontend “unit tests” are not implemented; e2e smoke exists and uses curl against a running stack. (`repo/frontend/tests/unit/README.md:1`, `repo/frontend/tests/e2e/smoke.sh:1`)
+- **Unit tests exist:** Yes (backend). Evidence: `backend/tests/unit.rs:1-15`.
+- **API/integration tests exist:** Yes (backend). Evidence: `backend/tests/api.rs:1-38`.
+- **Frontend unit tests:** No executable suite (doc only). Evidence: `frontend/tests/unit/README.md:1-22`.
+- **Test frameworks/entry points:** Rust `#[test]` + Actix integration tests + shell e2e smoke. Evidence: `backend/tests/api/*.rs`, `backend/tests/unit/*.rs`, `run_tests.sh:49-89`.
+- **Doc test commands:** Present. Evidence: `README.md:21-25`, `run_tests.sh:1-110`.
 
 ### 8.2 Coverage Mapping Table
-
-| Requirement / Risk Point | Mapped Test Case(s) | Key Assertion / Fixture / Mock | Coverage | Gap | Minimum Test Addition |
+| Requirement / Risk Point | Mapped Test Case(s) | Key Assertion / Fixture / Mock | Coverage Assessment | Gap | Minimum Test Addition |
 |---|---|---|---|---|---|
-| Unauthenticated access blocked (401) | `repo/backend/tests/api/auth.rs:72` | GET `/api/work-orders` returns 401 | Basically covered | Limited to one route | Add 401 tests for admin/super scopes and location routes |
-| Login success/invalid creds | `repo/backend/tests/api/auth.rs:15` | Token present, 401 on bad creds | Basically covered | No lockout/rate limiting tests | Add brute-force/rate limit policy tests (if required) |
-| RBAC: admin vs tech vs super visibility | `repo/backend/tests/api/work_orders.rs:7` | totals differ by role | Basically covered | Not exhaustive across all endpoints | Add RBAC tests for analytics export, notifications, recipes/tip-cards write paths |
-| Object-level auth (tech can’t read other job) | `repo/backend/tests/api/work_orders.rs:55` | Non-owner tech gets 404 | Sufficient | — | Add similar checks for location trail and progress upserts |
-| Transition required fields (GPS) | `repo/backend/tests/api/work_orders.rs:103` | 400 when missing lat/lng | Sufficient | Frontend integration not tested | Add a “frontend contract” test or update e2e to hit transition endpoints |
-| On-call queue role restriction | `repo/backend/tests/api/work_orders.rs:171` | TECH gets 403 | Basically covered | No edge cases around SLA thresholds | Add tests for threshold boundaries and `ON_CALL_HIGH_PRIORITY_HOURS` |
-| Step progress versioning cap | Covered implicitly in progress tests (later in file) | version increments on update | Insufficient | No test for max-30 pruning | Add test to upsert >30 times and assert versions pruned |
-| Sync “conflict flagged” counting | `repo/backend/tests/unit/sync_conflicts.rs:19` | unresolved conflicts counted | Basically covered | No deterministic merge policy tests | Add integration tests that simulate conflicting edits and verify supervisor resolution flow |
-| Analytics role scoping | (Not checked in opened snippets) | — | Cannot confirm | File not reviewed in detail | Add tests for TECH sees only own and SUPER sees branch only |
+| Auth login/401/reset-gate | `backend/tests/api/auth.rs` | 401/403 assertions, reset-required flow | sufficient | none material | add token-expiry edge-case |
+| Route RBAC matrix | `backend/tests/api/rbac.rs` | role x endpoint status matrix, error body checks | sufficient | none material | add more admin-trigger endpoints in matrix |
+| Object-level auth (work orders/trails/learning records) | `backend/tests/api/work_orders.rs`, `location.rs`, `learning.rs` | 404 anti-enumeration for cross-owner access | sufficient | none material | add more cross-branch SUPER negative cases |
+| State machine required fields/check-ins | `backend/tests/api/work_orders.rs`, `backend/tests/unit/state_machine.rs` | EnRoute gps required, cancel notes required, role legality | basically covered | limited coverage for OnSite/Completed gate via full flow | add explicit EnRoute->OnSite and InProgress->Completed gate tests |
+| Timer snapshot persistence | `backend/tests/api/recipes.rs` | snapshot round-trip assertions | basically covered | no frontend timer resume unit tests | add wasm tests for `TimerRing` restore/start/pause |
+| Sync deterministic merge/conflicts | `backend/tests/unit/sync_conflicts.rs`, `backend/tests/api/sync.rs` | conflict flagging, completed immutability, timestamp tie-breaks | sufficient | none material | add multi-record batch order test |
+| Notifications retry/backoff/unsubscribe/rate limit | `backend/tests/api/notifications.rs` | retry_count/delivered_at behavior, idempotent unsubscribe | sufficient | template coverage mostly schedule-change | add per-template generation path tests |
+| Analytics scoping/filter/export watermark | `backend/tests/api/analytics.rs` | role/date/branch filters, CSV watermark | sufficient (backend) | frontend branch filter + tech page access untested/undelivered | add frontend integration tests once UI fixed |
+| Retention soft-delete window | `backend/tests/api/retention.rs` | prune removes stale, preserves recent, admin-only | sufficient | none material | add processing_log retention interaction test |
+| Sensitive encryption utilities | `backend/tests/unit/crypto.rs` | roundtrip/tamper/wrong-key | sufficient | endpoint-level negative-path tests sparse | add `/api/me/home-address` error-path tests |
 
 ### 8.3 Security Coverage Audit
-- Authentication: **Basically covered** (login + bearer required) (`repo/backend/tests/api/auth.rs:15`, `repo/backend/tests/api/auth.rs:72`)
-- Route authorization (RBAC): **Basically covered** for some endpoints (`repo/backend/tests/api/admin.rs:7`, `repo/backend/tests/api/work_orders.rs:171`)
-- Object-level authorization (IDOR/BOLA): **Basically covered** for work order get (`repo/backend/tests/api/work_orders.rs:55`)
-- Tenant/data isolation: **Insufficient** (role/branch scoping exists, but not broadly tested across all data sets/endpoints)
-- Admin/internal protection: **Basically covered** (admin routes 403 for non-admin) (`repo/backend/tests/api/admin.rs:7`)
+- **Authentication tests:** **Covered well** (`backend/tests/api/auth.rs`).
+- **Route authorization tests:** **Covered well** (`backend/tests/api/rbac.rs`, module-specific API tests).
+- **Object-level authorization tests:** **Covered well** (`work_orders.rs`, `location.rs`, `learning.rs`, `sync.rs`).
+- **Tenant/data isolation tests:** **Basically covered** (branch and owner scope tests exist), but sync feed least-privilege policy for global recipe/tip-card rows is not explicitly tested as a security requirement.
+- **Admin/internal protection tests:** **Covered** (`backend/tests/api/admin.rs`, `sla.rs`, `retention.rs`, `sync.rs`).
 
 ### 8.4 Final Coverage Judgment
-**Partial Pass**
-
-Rationale: Tests cover key backend invariants (auth gates, some RBAC, some object-level auth, transition required fields). However, major prompt-critical risks (timers persistence, sync merge policy, full technician flow including check-ins) could still be broken while tests pass.
-
----
+- **Partial Pass**
+- Major backend risks are well covered statically, but frontend offline-first behavior and key UI requirement-fit gaps (tech analytics visibility, branch filter UI) can still leave severe product defects undetected despite backend tests passing.
 
 ## 9. Final Notes
-
-- This repository is structured and has meaningful backend tests and logging, but it does not currently meet the Prompt’s core “technician workflow + timers + offline sync” requirements as an end-to-end deliverable.
-- The biggest acceptance blockers are UI→API contract mismatches (required fields not provided) and placeholder implementations for timers and sync.
-
+- The backend is generally strong and evidence-rich.
+- The most material acceptance risks are requirement-fit gaps in frontend behavior and access, not foundational backend architecture.
+- Runtime guarantees (true offline UX continuity, tablet/browser behavior) remain manual verification items.

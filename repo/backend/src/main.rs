@@ -6,7 +6,7 @@ use fieldops_backend::middleware::rbac::JwtAuth;
 use fieldops_backend::middleware::request_log::RequestLog;
 use fieldops_backend::{
     bootstrap, configure, logging, spawn_notification_retry_worker, spawn_retention_worker,
-    spawn_sync_ticker,
+    spawn_sla_alert_worker, spawn_sync_ticker,
 };
 
 #[actix_web::main]
@@ -31,6 +31,7 @@ async fn main() -> std::io::Result<()> {
     spawn_sync_ticker(pool.clone(), cfg.business.sync_interval_minutes);
     spawn_notification_retry_worker(pool.clone(), cfg.clone());
     spawn_retention_worker(pool.clone(), cfg.clone());
+    spawn_sla_alert_worker(pool.clone(), cfg.clone());
 
     let cfg_data = web::Data::new(cfg.clone());
     let pool_data = web::Data::new(pool);

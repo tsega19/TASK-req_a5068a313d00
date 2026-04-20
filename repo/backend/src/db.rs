@@ -122,6 +122,7 @@ pub async fn truncate_all(pool: &PgPool) -> anyhow::Result<()> {
         location_trails,
         job_step_progress_versions,
         job_step_progress,
+        processing_log,
         work_order_transitions,
         work_orders,
         tip_cards,

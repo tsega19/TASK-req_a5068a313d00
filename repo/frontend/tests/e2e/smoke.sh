@@ -68,6 +68,113 @@ else
         "$([ "${me_code}" = "200" ] && echo 0 || echo 1)"
     grep -q "\"username\":\"${ADMIN_USER}\"" /tmp/e2e_me
     assert "me response contains admin username" $?
+
+    # -------------------------------------------------------------------
+    # 3b. PRD §6 password-reset gate: the seeded admin boots with
+    #     `password_reset_required = TRUE` when `REQUIRE_ADMIN_PASSWORD_CHANGE`
+    #     is set (docker-compose default). Every privileged route stays
+    #     behind the gate until the password is rotated. The rotation
+    #     itself is exempt, so we use the same bearer. The middleware
+    #     re-reads the DB flag on each request, so the *same* JWT unlocks
+    #     everything once the flag flips to FALSE.
+    # -------------------------------------------------------------------
+    if grep -q '"password_reset_required":true' /tmp/e2e_login; then
+        NEW_PASS="${ADMIN_PASS}-rotated-e2e"
+        rotate_code="$(curl -s -o /tmp/e2e_rotate \
+            -X POST \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"current_password\":\"${ADMIN_PASS}\",\"new_password\":\"${NEW_PASS}\"}" \
+            "${FRONTEND_URL}/api/auth/change-password" \
+            -w '%{http_code}')"
+        assert "forced password rotation returns 200 (got ${rotate_code})" \
+            "$([ "${rotate_code}" = "200" ] && echo 0 || echo 1)"
+        grep -q '"ok":true' /tmp/e2e_rotate
+        assert "rotation response body confirms ok:true" $?
+        ADMIN_PASS="${NEW_PASS}"
+    fi
+
+    # -------------------------------------------------------------------
+    # 4. Failure path: invalid bearer must return 401 with a structured
+    #    error envelope (not just a bare status — the UI parses the body).
+    # -------------------------------------------------------------------
+    bad_code="$(curl -s -o /tmp/e2e_bad \
+        -H "Authorization: Bearer not-a-real-token" \
+        "${FRONTEND_URL}/api/me" \
+        -w '%{http_code}')"
+    assert "/api/me rejects bad token with 401 (got ${bad_code})" \
+        "$([ "${bad_code}" = "401" ] && echo 0 || echo 1)"
+    grep -q '"code":"unauthorized"' /tmp/e2e_bad
+    assert "/api/me 401 body carries unauthorized code" $?
+
+    # -------------------------------------------------------------------
+    # 5. Failure path: wrong credentials rejection — the login shouldn't
+    #    leak whether the username exists.
+    # -------------------------------------------------------------------
+    wrong_code="$(curl -s -o /tmp/e2e_wrong \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"not-the-real-password\"}" \
+        "${FRONTEND_URL}/api/auth/login" \
+        -w '%{http_code}')"
+    assert "login with wrong password returns 401 (got ${wrong_code})" \
+        "$([ "${wrong_code}" = "401" ] && echo 0 || echo 1)"
+    grep -q '"error":"invalid credentials"' /tmp/e2e_wrong
+    assert "wrong-password 401 body has invalid-credentials error" $?
+
+    # -------------------------------------------------------------------
+    # 6. RBAC journey: the admin-only processing log must be reachable
+    #    for admin, and return a paginated body with total + data[].
+    # -------------------------------------------------------------------
+    plog_code="$(curl -s -o /tmp/e2e_plog \
+        -H "Authorization: Bearer ${token}" \
+        "${FRONTEND_URL}/api/admin/processing-log" \
+        -w '%{http_code}')"
+    assert "admin can read processing log (got ${plog_code})" \
+        "$([ "${plog_code}" = "200" ] && echo 0 || echo 1)"
+    # Body should carry pagination envelope — assert structure, not just 200.
+    grep -q '"total":' /tmp/e2e_plog
+    assert "processing-log response includes total" $?
+    grep -q '"data":' /tmp/e2e_plog
+    assert "processing-log response includes data array" $?
+
+    # -------------------------------------------------------------------
+    # 7. Workflow journey: list work orders, then drill into the first
+    #    one by id — exercises the most common tech path end-to-end.
+    # -------------------------------------------------------------------
+    wo_list_code="$(curl -s -o /tmp/e2e_wo_list \
+        -H "Authorization: Bearer ${token}" \
+        "${FRONTEND_URL}/api/work-orders" \
+        -w '%{http_code}')"
+    assert "work-orders list returns 200 (got ${wo_list_code})" \
+        "$([ "${wo_list_code}" = "200" ] && echo 0 || echo 1)"
+    grep -q '"data":' /tmp/e2e_wo_list
+    assert "work-orders list response includes data array" $?
+    # Extract the first work order id (UUID-shaped); skip if the list
+    # is empty (e.g. after a fresh DB wipe) rather than failing the suite.
+    first_id="$(sed -n 's/.*"data":\[{[^}]*"id":"\([0-9a-f-]\{36\}\)".*/\1/p' /tmp/e2e_wo_list)"
+    if [ -n "${first_id}" ]; then
+        detail_code="$(curl -s -o /tmp/e2e_wo_detail \
+            -H "Authorization: Bearer ${token}" \
+            "${FRONTEND_URL}/api/work-orders/${first_id}" \
+            -w '%{http_code}')"
+        assert "work-order detail round-trip (got ${detail_code})" \
+            "$([ "${detail_code}" = "200" ] && echo 0 || echo 1)"
+        grep -q "\"id\":\"${first_id}\"" /tmp/e2e_wo_detail
+        assert "work-order detail body echoes requested id" $?
+    else
+        echo "  SKIP work-order detail round-trip (no seed data)"
+    fi
+
+    # -------------------------------------------------------------------
+    # 8. Unauthenticated access to a privileged route must return 401 —
+    #    not 404, not 500. Exercises the JwtAuth middleware at the edge.
+    # -------------------------------------------------------------------
+    anon_code="$(curl -s -o /tmp/e2e_anon "${FRONTEND_URL}/api/work-orders" -w '%{http_code}')"
+    assert "unauthenticated /api/work-orders returns 401 (got ${anon_code})" \
+        "$([ "${anon_code}" = "401" ] && echo 0 || echo 1)"
+    grep -q '"code":"unauthorized"' /tmp/e2e_anon
+    assert "anonymous 401 body carries unauthorized code" $?
 fi
 
 echo

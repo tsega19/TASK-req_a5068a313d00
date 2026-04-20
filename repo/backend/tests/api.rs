@@ -12,8 +12,12 @@ pub mod common;
 pub mod admin;
 #[path = "api/analytics.rs"]
 pub mod analytics;
+#[path = "api/audit_log.rs"]
+pub mod audit_log;
 #[path = "api/auth.rs"]
 pub mod auth;
+#[path = "api/geocoding.rs"]
+pub mod geocoding;
 #[path = "api/learning.rs"]
 pub mod learning;
 #[path = "api/location.rs"]
@@ -28,6 +32,8 @@ pub mod rbac;
 pub mod recipes;
 #[path = "api/retention.rs"]
 pub mod retention;
+#[path = "api/sla.rs"]
+pub mod sla;
 #[path = "api/sync.rs"]
 pub mod sync;
 #[path = "api/work_orders.rs"]

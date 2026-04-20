@@ -43,6 +43,8 @@ mod tests {
         AuthConfig {
             jwt_secret: "x".into(),
             jwt_expiry_hours: 24,
+            jwt_issuer: "test".into(),
+            jwt_audience: "test".into(),
             argon2_memory_kib: 19456,
             argon2_iterations: 2,
             argon2_parallelism: 1,

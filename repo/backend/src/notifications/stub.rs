@@ -1,11 +1,21 @@
-// Mocking notification delivery.
+// In-app notification delivery state machine (PRD §7).
 //
-// No real push/email/SMS provider is contacted. `send` enqueues a row and
-// attempts an inline "soft" delivery, recording a delivered_at on success.
-// The retry worker (`retry_pending` below) scans pending rows on a schedule,
-// respects exponential backoff, caps retries at
-// `BusinessConfig::notification_retry_max_attempts`, and updates delivered_at
-// only when a simulated delivery succeeds.
+// "Stub" is a slight misnomer: no external provider is contacted, but the
+// delivery pipeline below exercises the full state machine — enqueue,
+// simulated attempt (which can fail), backoff, retry, and give-up — so the
+// retry/receipt semantics behave like a production pipeline and match the
+// PRD guarantees.
+//
+// Failure simulation:
+//   - Callers can request a deterministic failure by setting
+//     `{"_simulate_failure": true}` anywhere in the payload; this is how
+//     tests exercise the retry path.
+//   - Additionally, any payload with `_simulate_failure_count: N` causes
+//     the first N attempts to fail before success — covering both the
+//     "first attempt fails, retry succeeds" and "max attempts give up"
+//     behaviors without depending on wall-clock pseudo-randomness.
+//   - When no marker is present, attempts succeed (the happy path used by
+//     every production caller).
 
 use chrono::Utc;
 use sqlx::PgPool;
@@ -26,6 +36,76 @@ pub struct DeliveryOutcome {
     pub unsubscribed: bool,
 }
 
+/// Inspect a payload for the deterministic-failure markers documented at the
+/// top of this module. Returns `true` when the current attempt should fail.
+/// `attempts_so_far` is the value the row will be bumped to if this attempt
+/// fails — so `_simulate_failure_count: 2` fails attempts 1 and 2 and
+/// succeeds on attempt 3.
+fn should_simulate_failure(payload: &serde_json::Value, attempts_so_far: i32) -> bool {
+    if payload
+        .get("_simulate_failure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(n) = payload
+        .get("_simulate_failure_count")
+        .and_then(|v| v.as_i64())
+    {
+        return (attempts_so_far as i64) <= n;
+    }
+    false
+}
+
+/// Attempt a single delivery for the given notification row. On success
+/// updates `delivered_at` and bumps `retry_count`; on failure just bumps
+/// `retry_count` and leaves `delivered_at` NULL. Returns `true` on success.
+async fn attempt_delivery(
+    pool: &PgPool,
+    notification_id: Uuid,
+    payload: &serde_json::Value,
+    next_attempt: i32,
+) -> Result<bool, ApiError> {
+    if should_simulate_failure(payload, next_attempt) {
+        sqlx::query(
+            "UPDATE notifications SET retry_count = $1 WHERE id = $2",
+        )
+        .bind(next_attempt)
+        .bind(notification_id)
+        .execute(pool)
+        .await?;
+        log_warn!(
+            MODULE,
+            "delivery_failed",
+            "id={} attempt={} simulated provider failure",
+            notification_id,
+            next_attempt
+        );
+        Ok(false)
+    } else {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE notifications
+             SET retry_count = $1, delivered_at = $2
+             WHERE id = $3",
+        )
+        .bind(next_attempt)
+        .bind(now)
+        .bind(notification_id)
+        .execute(pool)
+        .await?;
+        log_info!(
+            MODULE,
+            "delivery_ok",
+            "id={} attempt={}",
+            notification_id,
+            next_attempt
+        );
+        Ok(true)
+    }
+}
+
 /// Enqueue + attempt a notification.
 ///
 /// Enforces:
@@ -33,9 +113,10 @@ pub struct DeliveryOutcome {
 ///   - per-user hourly rate limit (PRD §7: 20/user/hour),
 ///   - retry count tracking (PRD §7: exponential backoff, max attempts).
 ///
-/// In this stub, the first attempt always succeeds — retry_pending() is
-/// responsible for handling any row that lands without `delivered_at` (e.g.
-/// rate-limited rows that later become eligible, or future provider failures).
+/// The first attempt runs inline via [`attempt_delivery`]. When it fails
+/// (either a simulated provider error or, in a real deployment, a transient
+/// connection issue), the row stays `delivered_at = NULL` with an elevated
+/// `retry_count` so [`retry_pending`] will pick it up after backoff.
 pub async fn send(
     pool: &PgPool,
     cfg: &AppConfig,
@@ -89,6 +170,8 @@ pub async fn send(
             template,
             recent
         );
+        // Row is persisted as PENDING (no delivered_at, retry_count=0) so
+        // retry_pending can pick it up once the hourly window rolls forward.
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO notifications (user_id, template_type, payload)
              VALUES ($1, $2, $3) RETURNING id",
@@ -107,24 +190,33 @@ pub async fn send(
         });
     }
 
-    // First attempt succeeds under the stub.
-    let now = Utc::now();
+    // Insert PENDING first, then run one delivery attempt. This keeps the
+    // row's history coherent if the attempt fails: caller can rely on the
+    // retry worker to converge.
     let id = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO notifications (user_id, template_type, payload, delivered_at, retry_count)
-         VALUES ($1, $2, $3, $4, 1) RETURNING id",
+        "INSERT INTO notifications (user_id, template_type, payload, retry_count)
+         VALUES ($1, $2, $3, 0) RETURNING id",
     )
     .bind(user_id)
     .bind(template)
     .bind(&payload)
-    .bind(now)
     .fetch_one(pool)
     .await?;
 
-    log_info!(MODULE, "send", "user={} template={:?} id={} delivered", user_id, template, id);
+    let delivered = attempt_delivery(pool, id, &payload, 1).await?;
+    log_info!(
+        MODULE,
+        "send",
+        "user={} template={:?} id={} delivered={}",
+        user_id,
+        template,
+        id,
+        delivered
+    );
     Ok(DeliveryOutcome {
         notification_id: id,
         attempts: 1,
-        delivered: true,
+        delivered,
         rate_limited: false,
         unsubscribed: false,
     })
@@ -145,19 +237,24 @@ pub struct RetryReport {
     pub delivered: i64,
     pub giveup: i64,
     pub skipped_backoff: i64,
+    pub failed_again: i64,
+    pub rate_limited_waiting: i64,
 }
 
-/// Scan undelivered notifications and attempt re-delivery. A row is eligible
-/// when `delivered_at IS NULL AND is_unsubscribed = FALSE AND retry_count <
-/// max_attempts AND created_at + backoff(retry_count + 1) <= NOW()`.
+/// Scan undelivered notifications and attempt re-delivery. Eligibility rules:
 ///
-/// Because this is a stub, "attempt" always succeeds — but the important part
-/// is the bookkeeping: retry_count increments, delivered_at lands only on the
-/// successful attempt, and rows that exceeded max attempts are logged as a
-/// give-up so operators can notice.
+///   - skip unsubscribed rows,
+///   - skip rows still inside the hourly rate-limit window for the user
+///     (they become eligible once the window rolls),
+///   - skip rows whose created_at + backoff(retry_count + 1) hasn't elapsed,
+///   - give up on rows that have already exhausted max_attempts.
+///
+/// Each attempt goes through [`attempt_delivery`] — which may succeed OR
+/// simulate a failure deterministically based on payload markers — so the
+/// retry path is genuinely exercised even without a real delivery provider.
 pub async fn retry_pending(pool: &PgPool, cfg: &AppConfig) -> Result<RetryReport, ApiError> {
-    let pending: Vec<(Uuid, i32, chrono::DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, retry_count, created_at FROM notifications
+    let pending: Vec<(Uuid, Uuid, i32, chrono::DateTime<Utc>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, user_id, retry_count, created_at, payload FROM notifications
          WHERE delivered_at IS NULL
            AND is_unsubscribed = FALSE
          ORDER BY created_at ASC",
@@ -165,14 +262,19 @@ pub async fn retry_pending(pool: &PgPool, cfg: &AppConfig) -> Result<RetryReport
     .fetch_all(pool)
     .await?;
 
-    let mut report = RetryReport { scanned: 0, delivered: 0, giveup: 0, skipped_backoff: 0 };
+    let mut report = RetryReport {
+        scanned: 0,
+        delivered: 0,
+        giveup: 0,
+        skipped_backoff: 0,
+        failed_again: 0,
+        rate_limited_waiting: 0,
+    };
     let max = cfg.business.notification_retry_max_attempts;
 
-    for (id, retry_count, created_at) in pending {
+    for (id, user_id, retry_count, created_at, payload) in pending {
         report.scanned += 1;
         if retry_count as u32 >= max {
-            // Already at cap; mark it one past and move on so we don't keep
-            // scanning it forever.
             if (retry_count as u32) == max {
                 sqlx::query(
                     "UPDATE notifications SET retry_count = retry_count + 1 WHERE id = $1",
@@ -186,6 +288,22 @@ pub async fn retry_pending(pool: &PgPool, cfg: &AppConfig) -> Result<RetryReport
             continue;
         }
 
+        // Honor the user's rolling rate limit — previously rate-limited rows
+        // become eligible once the hour has passed.
+        let still_rate_limited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notifications
+             WHERE user_id = $1
+               AND delivered_at IS NOT NULL
+               AND created_at > NOW() - INTERVAL '1 hour'",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+        if still_rate_limited >= cfg.business.max_notifications_per_hour as i64 {
+            report.rate_limited_waiting += 1;
+            continue;
+        }
+
         let next_attempt = (retry_count as u32) + 1;
         let wait = backoff_seconds(next_attempt, cfg) as i64;
         let eligible_at = created_at + chrono::Duration::seconds(wait);
@@ -194,31 +312,24 @@ pub async fn retry_pending(pool: &PgPool, cfg: &AppConfig) -> Result<RetryReport
             continue;
         }
 
-        // Stub "attempt" — always succeeds.
-        let now = Utc::now();
-        sqlx::query(
-            "UPDATE notifications
-             SET retry_count  = $1,
-                 delivered_at = $2
-             WHERE id = $3",
-        )
-        .bind(next_attempt as i32)
-        .bind(now)
-        .bind(id)
-        .execute(pool)
-        .await?;
-        report.delivered += 1;
-        log_info!(MODULE, "retry_delivered", "id={} attempt={}", id, next_attempt);
+        let delivered = attempt_delivery(pool, id, &payload, next_attempt as i32).await?;
+        if delivered {
+            report.delivered += 1;
+        } else {
+            report.failed_again += 1;
+        }
     }
 
     log_info!(
         MODULE,
         "retry_tick",
-        "scanned={} delivered={} giveup={} waiting={}",
+        "scanned={} delivered={} giveup={} waiting={} failed_again={} rate_limited_waiting={}",
         report.scanned,
         report.delivered,
         report.giveup,
-        report.skipped_backoff
+        report.skipped_backoff,
+        report.failed_again,
+        report.rate_limited_waiting
     );
     Ok(report)
 }
@@ -244,6 +355,8 @@ mod tests {
                 argon2_memory_kib: 1,
                 argon2_iterations: 1,
                 argon2_parallelism: 1,
+                jwt_issuer: "fieldops-test".into(),
+                jwt_audience: "fieldops-test".into(),
             },
             encryption: crate::config::EncryptionConfig { aes_256_key: [0u8; 32] },
             logging: crate::config::LoggingConfig { level: "info".into(), format: "structured".into() },
@@ -265,6 +378,7 @@ mod tests {
                 default_admin_password: "".into(),
                 dev_mode: true,
                 require_admin_password_change: false,
+                allow_geocode_fallback: true,
             },
         }
     }
@@ -278,5 +392,20 @@ mod tests {
         assert_eq!(backoff_seconds(4, &c), 8);
         assert_eq!(backoff_seconds(5, &c), 16);
         assert_eq!(backoff_seconds(6, &c), 0); // beyond max
+    }
+
+    #[test]
+    fn simulate_failure_flag_recognized() {
+        let payload = serde_json::json!({"_simulate_failure": true});
+        assert!(should_simulate_failure(&payload, 1));
+        assert!(should_simulate_failure(&payload, 9));
+    }
+
+    #[test]
+    fn simulate_failure_count_bounds_fails() {
+        let payload = serde_json::json!({"_simulate_failure_count": 2});
+        assert!(should_simulate_failure(&payload, 1));
+        assert!(should_simulate_failure(&payload, 2));
+        assert!(!should_simulate_failure(&payload, 3));
     }
 }

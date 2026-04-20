@@ -240,6 +240,54 @@ async fn on_call_queue_returns_high_priority_near_deadline() {
 }
 
 #[actix_web::test]
+async fn on_call_queue_super_sees_only_own_branch() {
+    // PRD supervisor-scope rule: SUPER may only see on-call work orders from
+    // their own branch. ADMIN sees everything. (Re-audit High #1 / Medium #4.)
+    let ctx = setup().await;
+    // Put both WOs near breach so branch scoping is the ONLY thing that can
+    // hide one of them.
+    sqlx::query(
+        "UPDATE work_orders
+         SET sla_deadline = NOW() + INTERVAL '1 hour',
+             priority = 'HIGH'
+         WHERE id IN ($1, $2)",
+    )
+    .bind(ctx.wo_a_id)
+    .bind(ctx.wo_b_id)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    // SUPER in branch A must see WO-A and NOT WO-B.
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/work-orders/on-call-queue")
+        .insert_header(auth_header(&ctx.super_token))
+        .to_request();
+    let (status, body) = raw_of(&app, req).await;
+    assert_eq!(status, 200);
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&ctx.wo_a_id.to_string()), "SUPER must see own branch's WO-A");
+    assert!(!ids.contains(&ctx.wo_b_id.to_string()), "SUPER must NOT see other branch's WO-B");
+    assert_eq!(body["total"].as_i64().unwrap(), 1);
+
+    // ADMIN remains global.
+    let app2 = make_service(&ctx).await;
+    let req2 = TestRequest::get()
+        .uri("/api/work-orders/on-call-queue")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status2, body2) = raw_of(&app2, req2).await;
+    assert_eq!(status2, 200);
+    assert_eq!(body2["total"].as_i64().unwrap(), 2, "ADMIN sees both branches");
+}
+
+#[actix_web::test]
 async fn admin_can_soft_delete_work_order() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;

@@ -3,6 +3,11 @@
 //! - `JwtAuth` middleware extracts the `Authorization: Bearer <token>` header,
 //!   verifies it against `AppConfig::auth`, and inserts `Claims` into the
 //!   request extensions so handlers and route guards can read them.
+//! - `JwtAuth` also enforces the PRD §6 password-reset gate: once a user row
+//!   has `password_reset_required = TRUE`, every authenticated path other
+//!   than `/api/auth/change-password`, `/api/auth/logout`, and the health
+//!   endpoints returns `403 password_reset_required` — the flag is not just
+//!   documented, it's the authoritative gatekeeper.
 //! - `AuthedUser` is an Actix extractor handlers use to access the claims.
 //! - `require_role(role)` / `require_any_role(&[…])` produce guard-style
 //!   wrappers used at the route level; this gives two enforcement layers
@@ -19,6 +24,7 @@ use actix_web::{
     Error, FromRequest, HttpMessage, HttpResponse,
 };
 use futures_util::future::{ready, LocalBoxFuture, Ready};
+use sqlx::PgPool;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
@@ -26,6 +32,25 @@ use crate::auth::jwt::{verify, Claims};
 use crate::auth::models::Role;
 use crate::config::AppConfig;
 use crate::errors::ApiError;
+
+/// Routes that an authenticated user MUST be able to reach even when
+/// `password_reset_required = TRUE`. Everything else is denied until the user
+/// rotates the password. Keep the list minimal — PRD §6.
+///
+/// `/api/me` (profile lookup) is exempt so the client can render "who am I"
+/// on the forced-change-password screen without a second authenticated round
+/// trip. The sub-paths under `/api/me/*` (privacy toggle, home-address
+/// write/read) remain *privileged* and stay behind the gate.
+fn is_reset_exempt_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/auth/change-password"
+            | "/api/auth/logout"
+            | "/health"
+            | "/api/health"
+            | "/api/me"
+    )
+}
 
 // -----------------------------------------------------------------------------
 // JwtAuth middleware
@@ -108,16 +133,62 @@ where
                     }
                 };
 
-                match verify(&token, &cfg.auth) {
-                    Ok(claims) => {
-                        req.extensions_mut().insert(claims);
-                    }
+                let claims = match verify(&token, &cfg.auth) {
+                    Ok(claims) => claims,
                     Err(_) => {
                         let resp = HttpResponse::Unauthorized()
                             .json(serde_json::json!({"error":"invalid token","code":"unauthorized"}));
                         return Ok(req.into_response(resp.map_into_right_body()));
                     }
+                };
+
+                // PRD §6 security gate: a user flagged `password_reset_required`
+                // must rotate before executing any privileged action. Enforced
+                // server-side — not just advertised in the login response. The
+                // gate fails closed: a missing pool or DB error denies the call.
+                if !is_reset_exempt_path(&path) {
+                    let pool = match req.app_data::<actix_web::web::Data<PgPool>>() {
+                        Some(p) => p.clone(),
+                        None => {
+                            let resp = HttpResponse::InternalServerError()
+                                .json(serde_json::json!({"error":"pool missing","code":"internal_error"}));
+                            return Ok(req.into_response(resp.map_into_right_body()));
+                        }
+                    };
+                    let reset_required: Result<Option<bool>, _> = sqlx::query_scalar(
+                        "SELECT password_reset_required FROM users
+                         WHERE id = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(claims.sub)
+                    .fetch_optional(pool.get_ref())
+                    .await;
+                    match reset_required {
+                        Ok(Some(true)) => {
+                            let resp = HttpResponse::Forbidden().json(serde_json::json!({
+                                "error": "password reset required before privileged actions",
+                                "code": "password_reset_required"
+                            }));
+                            return Ok(req.into_response(resp.map_into_right_body()));
+                        }
+                        Ok(None) => {
+                            // User missing or soft-deleted — treat as unauthenticated.
+                            let resp = HttpResponse::Unauthorized().json(serde_json::json!({
+                                "error": "user not found",
+                                "code": "unauthorized"
+                            }));
+                            return Ok(req.into_response(resp.map_into_right_body()));
+                        }
+                        Ok(Some(false)) => {}
+                        Err(_) => {
+                            let resp = HttpResponse::InternalServerError().json(
+                                serde_json::json!({"error":"auth gate db error","code":"internal_error"}),
+                            );
+                            return Ok(req.into_response(resp.map_into_right_body()));
+                        }
+                    }
                 }
+
+                req.extensions_mut().insert(claims);
             }
 
             let res = srv.call(req).await?;
@@ -202,6 +273,8 @@ mod tests {
             branch_id: None,
             iat: Utc::now().timestamp(),
             exp: Utc::now().timestamp() + 3600,
+            iss: "fieldops-test".into(),
+            aud: "fieldops-test".into(),
         })
     }
 

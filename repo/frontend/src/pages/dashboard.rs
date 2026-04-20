@@ -1,10 +1,10 @@
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use crate::api;
 use crate::app::{toast_err, AuthCtx, ToastCtx};
 use crate::components::sla::SlaCountdown;
 use crate::components::state_badge::{PriorityBadge, StateBadge};
+use crate::offline;
 use crate::routes::Route;
 use crate::types::{Paginated, WorkOrder};
 
@@ -26,7 +26,9 @@ pub fn dashboard() -> Html {
         use_effect_with((), move |_| {
             let state = auth.state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match api::get::<Paginated<WorkOrder>>(
+                // Offline-first: offline::get_cached serves a cached copy when
+                // the network drops so the technician's job list still loads.
+                match offline::get_cached::<Paginated<WorkOrder>>(
                     "/api/work-orders?per_page=50",
                     &state,
                 )

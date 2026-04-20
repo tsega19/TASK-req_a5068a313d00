@@ -17,6 +17,7 @@ use crate::auth::models::{Role, UserRow};
 use crate::config::AppConfig;
 use crate::errors::ApiError;
 use crate::middleware::rbac::AuthedUser;
+use crate::processing_log;
 use crate::{log_info, log_warn};
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +79,19 @@ pub async fn login(
     }
 
     let token = jwt::issue(user.id, &user.username, user.role, user.branch_id, &cfg.auth)?;
+    // Audit trail MUST land atomically — if the log write fails, fail closed so
+    // an operator never sees a successful login without a corresponding row.
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.id),
+        processing_log::actions::AUTH_LOGIN,
+        "users",
+        Some(user.id),
+        serde_json::json!({ "username": user.username }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!("auth", "login", "user '{}' authenticated", user.username);
 
     Ok(HttpResponse::Ok().json(LoginResponse {
@@ -94,7 +108,23 @@ pub async fn login(
 }
 
 #[post("/logout")]
-pub async fn logout(user: AuthedUser) -> Result<HttpResponse, ApiError> {
+pub async fn logout(
+    user: AuthedUser,
+    pool: web::Data<PgPool>,
+) -> Result<HttpResponse, ApiError> {
+    // Per PRD §7 "every user action writes an immutable processing log": even
+    // a stateless-JWT logout is a user action and MUST leave an audit row.
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::AUTH_LOGOUT,
+        "users",
+        Some(user.user_id()),
+        serde_json::json!({ "stateless_jwt": true }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!("auth", "logout", "logout acknowledged user={} (stateless JWT — client must drop token)", user.user_id());
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "ok": true,
@@ -137,6 +167,7 @@ pub async fn change_password(
         ));
     }
     let new_hash = hash_password(&req.new_password, &cfg.auth)?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE users
          SET password_hash = $1,
@@ -146,8 +177,18 @@ pub async fn change_password(
     )
     .bind(&new_hash)
     .bind(user.user_id())
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::AUTH_CHANGE_PASSWORD,
+        "users",
+        Some(user.user_id()),
+        serde_json::json!({}),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!("auth", "change_password", "user={} rotated password", user.user_id());
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true })))
 }

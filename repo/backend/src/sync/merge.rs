@@ -4,11 +4,18 @@
 //!   1. Completed step logs are IMMUTABLE — a "completed" progress row is
 //!      never overwritten by a later incoming payload. Any such attempt is
 //!      recorded as a conflict row in `sync_log`, awaiting SUPER review.
-//!   2. Higher-version payloads win over lower-version ones deterministically
-//!      (ties broken by newest `updated_at` on the incoming side; further ties
-//!      are flagged as conflicts — never silently dropped).
+//!   2. Higher-version payloads win over lower-version ones deterministically.
+//!      Equal-version conflicts are broken by timestamp: the payload with the
+//!      later `updated_at` wins. Only strictly equal `updated_at` divergent
+//!      edits are flagged as conflicts — never silently dropped.
 //!   3. Step notes from a completed step are appended, never replaced, by any
 //!      other replica.
+//!   4. Concurrent note edits ALWAYS require supervisor review: when both the
+//!      local and incoming sides have non-empty `notes` that disagree at the
+//!      same version, the merge flags a conflict regardless of timestamp.
+//!      Timestamps can be untrustworthy across offline replicas, and notes
+//!      carry narrative context a later-writer-wins rule would silently
+//!      obliterate.
 //!
 //! The merge function returns a `MergeOutcome` so callers can see exactly what
 //! happened (applied / rejected / flagged). All flagged conflicts land in
@@ -71,8 +78,9 @@ pub async fn merge_step_progress(
         Option<String>,
         Option<serde_json::Value>,
         i32,
+        DateTime<Utc>,
     )> = sqlx::query_as(
-        "SELECT id, status, notes, timer_state_snapshot, version
+        "SELECT id, status, notes, timer_state_snapshot, version, updated_at
          FROM job_step_progress
          WHERE work_order_id = $1 AND step_id = $2
          FOR UPDATE",
@@ -96,8 +104,8 @@ pub async fn merge_step_progress(
             sqlx::query(
                 "INSERT INTO job_step_progress
                     (work_order_id, step_id, status, notes, timer_state_snapshot,
-                     etag, version)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                     etag, version, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             )
             .bind(incoming.work_order_id)
             .bind(incoming.step_id)
@@ -106,12 +114,13 @@ pub async fn merge_step_progress(
             .bind(&incoming.timer_state_snapshot)
             .bind(&etag_v)
             .bind(incoming.version)
+            .bind(incoming.updated_at)
             .execute(&mut *tx)
             .await?;
             log_sync(&mut tx, incoming, SyncOperation::Insert, &etag_v, false).await?;
             MergeOutcome::Applied
         }
-        Some((row_id, local_status, local_notes, local_timer, local_version)) => {
+        Some((row_id, local_status, local_notes, local_timer, local_version, local_updated_at)) => {
             // Invariant 1: completed logs are immutable. Only a same-as-local
             // Completed payload is allowed through (idempotency); anything
             // else is a flagged conflict.
@@ -161,22 +170,104 @@ pub async fn merge_step_progress(
                     MergeOutcome::Conflict
                 }
             }
-            // Invariant 2: higher-version payload wins; equal version with a
-            // different payload is a conflict.
+            // Invariant 2: version dominates; equal-version ties are broken
+            // deterministically by timestamp (later wins). Only strictly equal
+            // timestamps with a different payload are flagged as conflicts.
             else if incoming.version < local_version {
                 MergeOutcome::RejectedOlder
             } else if incoming.version == local_version {
                 let same_payload = incoming.status == local_status
                     && incoming.notes == local_notes
                     && incoming.timer_state_snapshot == local_timer;
+                // Invariant 4: dual note edits at the same version ALWAYS
+                // require SUPER review — timestamp precedence is insufficient
+                // because losing a technician's narrative is unacceptable.
+                let both_notes_present = incoming
+                    .notes
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+                    && local_notes
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                let notes_disagree = incoming.notes != local_notes;
+                let dual_notes_edit = both_notes_present && notes_disagree;
                 if same_payload {
                     MergeOutcome::RejectedOlder
-                } else {
+                } else if dual_notes_edit {
                     let etag_v = etag::from_parts([
                         row_id.to_string(),
                         format!("{:?}", local_status),
                         local_version.to_string(),
                     ]);
+                    log_warn!(
+                        MODULE,
+                        "dual_notes_conflict",
+                        "wo={} step={} — both sides edited notes, flagged for SUPER",
+                        incoming.work_order_id,
+                        incoming.step_id
+                    );
+                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, true).await?;
+                    MergeOutcome::Conflict
+                } else if incoming.updated_at > local_updated_at {
+                    // Later-timestamp payload wins deterministically (PRD §8).
+                    let next_version = local_version + 1;
+                    let etag_v = etag::from_parts([
+                        row_id.to_string(),
+                        format!("{:?}", incoming.status),
+                        next_version.to_string(),
+                        incoming.updated_at.timestamp().to_string(),
+                    ]);
+                    sqlx::query(
+                        "UPDATE job_step_progress
+                         SET status = $1,
+                             notes = COALESCE($2, notes),
+                             timer_state_snapshot = COALESCE($3, timer_state_snapshot),
+                             etag = $4,
+                             version = $5,
+                             updated_at = $6
+                         WHERE id = $7",
+                    )
+                    .bind(incoming.status)
+                    .bind(&incoming.notes)
+                    .bind(&incoming.timer_state_snapshot)
+                    .bind(&etag_v)
+                    .bind(next_version)
+                    .bind(incoming.updated_at)
+                    .bind(row_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    log_info!(
+                        MODULE,
+                        "timestamp_priority_applied",
+                        "wo={} step={} local_ts={} incoming_ts={} — later wins",
+                        incoming.work_order_id,
+                        incoming.step_id,
+                        local_updated_at,
+                        incoming.updated_at
+                    );
+                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, false).await?;
+                    MergeOutcome::Applied
+                } else if incoming.updated_at < local_updated_at {
+                    // Strictly older incoming timestamp loses deterministically.
+                    MergeOutcome::RejectedOlder
+                } else {
+                    // Equal version AND equal timestamp but divergent payloads —
+                    // the only genuinely ambiguous case. Escalate to SUPER.
+                    let etag_v = etag::from_parts([
+                        row_id.to_string(),
+                        format!("{:?}", local_status),
+                        local_version.to_string(),
+                    ]);
+                    log_warn!(
+                        MODULE,
+                        "equal_timestamp_conflict",
+                        "wo={} step={} ts={} — flagged for SUPER",
+                        incoming.work_order_id,
+                        incoming.step_id,
+                        incoming.updated_at
+                    );
                     log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, true).await?;
                     MergeOutcome::Conflict
                 }
@@ -194,14 +285,16 @@ pub async fn merge_step_progress(
                          notes = COALESCE($2, notes),
                          timer_state_snapshot = COALESCE($3, timer_state_snapshot),
                          etag = $4,
-                         version = $5
-                     WHERE id = $6",
+                         version = $5,
+                         updated_at = $6
+                     WHERE id = $7",
                 )
                 .bind(incoming.status)
                 .bind(&incoming.notes)
                 .bind(&incoming.timer_state_snapshot)
                 .bind(&etag_v)
                 .bind(incoming.version)
+                .bind(incoming.updated_at)
                 .bind(row_id)
                 .execute(&mut *tx)
                 .await?;

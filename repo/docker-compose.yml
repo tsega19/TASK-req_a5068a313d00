@@ -4,13 +4,13 @@ version: "3.9"
 # ALL environment variables live in this file.
 # The backend reads these ONLY via the backend/config module.
 #
-# ⚠️  DEVELOPMENT DEFAULTS ONLY.
+# WARNING: DEVELOPMENT DEFAULTS ONLY.
 # The values below (JWT_SECRET, AES_256_KEY_HEX, DEFAULT_ADMIN_PASSWORD) are
 # known placeholders. They are accepted ONLY because DEV_MODE=true is set
 # below. For a real deployment you MUST:
 #   1. Set DEV_MODE=false (or remove it),
 #   2. Replace JWT_SECRET / AES_256_KEY_HEX / DEFAULT_ADMIN_PASSWORD with
-#      securely generated values — otherwise startup hard-fails with
+#      securely generated values - otherwise startup hard-fails with
 #      "insecure placeholder detected",
 #   3. Keep REQUIRE_ADMIN_PASSWORD_CHANGE=true so the seeded admin must rotate
 #      their password on first login.
@@ -58,6 +58,10 @@ services:
       # --- Auth ---
       JWT_SECRET: dev-jwt-secret-change-in-prod-0123456789abcdef
       JWT_EXPIRY_HOURS: "24"
+      # iss / aud are verified on every request — change these per deployment
+      # so a token minted for dev cannot be replayed against staging/prod.
+      JWT_ISSUER: fieldops-backend
+      JWT_AUDIENCE: fieldops-frontend
       ARGON2_MEMORY_KIB: "19456"
       ARGON2_ITERATIONS: "2"
       ARGON2_PARALLELISM: "1"
@@ -116,6 +120,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: runtime
     container_name: fieldops_frontend
     restart: unless-stopped
     depends_on:
@@ -125,6 +130,75 @@ services:
       PUBLIC_API_BASE: http://localhost:8080
     ports:
       - "8081:80"
+
+  # Dockerized frontend wasm unit-test runner. Invoked by run_tests.sh under
+  # the `tests` profile so the main test pipeline has zero host dependencies.
+  # Uses the `tester` stage of frontend/Dockerfile; runs every
+  # #[wasm_bindgen_test] in the crate via wasm-bindgen-test-runner + Node.
+  frontend-test:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: tester
+    profiles: ["tests"]
+    # No ports, no network deps — these are pure-logic tests, they don't
+    # touch the backend or the DB.
+
+  # Opt-in backend coverage runner. Uses the pre-built tarpaulin image so
+  # we don't burn image-build time installing llvm-tools + cargo-llvm-cov
+  # on every test run. Writes an HTML report + a Cobertura XML artifact
+  # to the host under .tmp/coverage/.
+  backend-coverage:
+    image: xd009642/tarpaulin:latest
+    profiles: ["coverage"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+      - ./.tmp/coverage:/coverage
+    environment:
+      DATABASE_URL: postgres://fieldops:fieldops_pw@postgres:5432/fieldops
+      RUST_BACKTRACE: "1"
+    entrypoint:
+      - cargo
+      - tarpaulin
+      - --engine
+      - llvm
+      - --workspace
+      - --out
+      - Html
+      - --out
+      - Xml
+      - --output-dir
+      - /coverage
+      - --timeout
+      - "300"
+      - --skip-clean
+      - --
+      - --test-threads=1
+
+  # Dockerized E2E smoke runner. Lives on the compose default network so it
+  # can reach the `frontend` service by hostname without needing host ports
+  # published. Previously this step ran on the host with its own curl binary.
+  #
+  # Uses stock `alpine` (busybox ships sh/grep/sed) and installs curl on
+  # boot — the alpine/curl pre-built tag has unstable versioning on Docker
+  # Hub and the compose build cache was hitting `not found` 404s.
+  e2e-smoke:
+    image: alpine:3.20
+    profiles: ["e2e"]
+    depends_on:
+      - frontend
+      - backend
+    volumes:
+      - ./frontend/tests/e2e:/e2e:ro
+    environment:
+      FRONTEND_URL: http://frontend
+      ADMIN_USER: admin
+      ADMIN_PASS: admin123
+    entrypoint: ["sh", "-c", "apk add --no-cache curl >/dev/null && sh /e2e/smoke.sh"]
 
 volumes:
   pg_data:

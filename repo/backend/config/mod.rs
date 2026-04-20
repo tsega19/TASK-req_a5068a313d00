@@ -35,6 +35,12 @@ pub struct HttpConfig {
 pub struct AuthConfig {
     pub jwt_secret: String,
     pub jwt_expiry_hours: i64,
+    /// JWT `iss` claim issued and enforced on verification. Bound to a
+    /// service-specific value so tokens minted for one deployment cannot be
+    /// replayed against another (defense-in-depth against token confusion).
+    pub jwt_issuer: String,
+    /// JWT `aud` claim issued and enforced on verification — see `jwt_issuer`.
+    pub jwt_audience: String,
     pub argon2_memory_kib: u32,
     pub argon2_iterations: u32,
     pub argon2_parallelism: u32,
@@ -45,6 +51,8 @@ impl fmt::Debug for AuthConfig {
         f.debug_struct("AuthConfig")
             .field("jwt_secret", &"<redacted>")
             .field("jwt_expiry_hours", &self.jwt_expiry_hours)
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
             .field("argon2_memory_kib", &self.argon2_memory_kib)
             .field("argon2_iterations", &self.argon2_iterations)
             .field("argon2_parallelism", &self.argon2_parallelism)
@@ -95,6 +103,12 @@ pub struct AppBehaviorConfig {
     /// fails if any of those known placeholders are detected in configuration.
     pub dev_mode: bool,
     pub require_admin_password_change: bool,
+    /// When true, the geocoder's deterministic-hash fallback is allowed for
+    /// addresses that don't match the bundled ZIP+4/street index. When false
+    /// (production default), unknown addresses produce a 400 at the API
+    /// boundary so synthetic coordinates can't silently pollute radius and
+    /// trail data. Env var: `ALLOW_GEOCODE_FALLBACK`.
+    pub allow_geocode_fallback: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,6 +222,8 @@ impl AppConfig {
                     s
                 },
                 jwt_expiry_hours: parse_num("JWT_EXPIRY_HOURS", 24i64)?,
+                jwt_issuer: optional("JWT_ISSUER", "fieldops-backend"),
+                jwt_audience: optional("JWT_AUDIENCE", "fieldops-frontend"),
                 argon2_memory_kib: parse_num("ARGON2_MEMORY_KIB", 19456u32)?,
                 argon2_iterations: parse_num("ARGON2_ITERATIONS", 2u32)?,
                 argon2_parallelism: parse_num("ARGON2_PARALLELISM", 1u32)?,
@@ -247,6 +263,9 @@ impl AppConfig {
                 },
                 dev_mode,
                 require_admin_password_change,
+                // Default: permitted in dev, denied in production. Operator can
+                // override in either direction via ALLOW_GEOCODE_FALLBACK.
+                allow_geocode_fallback: parse_bool("ALLOW_GEOCODE_FALLBACK", dev_mode)?,
             },
         })
     }
@@ -274,6 +293,8 @@ impl AppConfig {
             auth: AuthConfig {
                 jwt_secret: "test-jwt-secret-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
                 jwt_expiry_hours: 1,
+                jwt_issuer: "fieldops-test".into(),
+                jwt_audience: "fieldops-test".into(),
                 argon2_memory_kib: 8192,
                 argon2_iterations: 2,
                 argon2_parallelism: 1,
@@ -298,6 +319,9 @@ impl AppConfig {
                 default_admin_password: "admin123".into(),
                 dev_mode: true,
                 require_admin_password_change: false,
+                // Tests exercise both paths; default to allow so existing
+                // geocode tests keep passing. Strict-mode tests flip to false.
+                allow_geocode_fallback: true,
             },
         }
     }
@@ -347,6 +371,8 @@ mod tests {
         let c = AuthConfig {
             jwt_secret: "supersecret".into(),
             jwt_expiry_hours: 24,
+            jwt_issuer: "iss".into(),
+            jwt_audience: "aud".into(),
             argon2_memory_kib: 19456,
             argon2_iterations: 2,
             argon2_parallelism: 1,

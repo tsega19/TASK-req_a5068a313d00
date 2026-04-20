@@ -206,6 +206,28 @@ pub async fn make_service(
     .await
 }
 
+/// Variant of `make_service` that accepts a caller-supplied `AppConfig`.
+/// Used by strict-mode tests that need to flip feature flags
+/// (e.g. `allow_geocode_fallback`) without polluting the default `Ctx`.
+pub async fn make_service_with_cfg(
+    ctx: &Ctx,
+    cfg: AppConfig,
+) -> impl actix_web::dev::Service<
+    actix_http::Request,
+    Response = ServiceResponse<EitherBody<BoxBody>>,
+    Error = actix_web::Error,
+> {
+    let pool = ctx.pool.clone();
+    test::init_service(
+        App::new()
+            .app_data(web::Data::new(cfg))
+            .app_data(web::Data::new(pool))
+            .wrap(JwtAuth)
+            .configure(configure),
+    )
+    .await
+}
+
 pub async fn status_of<S, B>(svc: &S, req: actix_http::Request) -> u16
 where
     S: actix_web::dev::Service<

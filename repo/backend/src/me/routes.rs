@@ -10,6 +10,7 @@ use crate::config::AppConfig;
 use crate::crypto;
 use crate::errors::ApiError;
 use crate::middleware::rbac::AuthedUser;
+use crate::processing_log;
 use crate::{log_info, log_warn};
 
 const MODULE: &str = "me";
@@ -72,14 +73,25 @@ pub async fn set_privacy(
     body: web::Json<PrivacyBody>,
 ) -> Result<HttpResponse, ApiError> {
     let new_val = body.privacy_mode;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE users SET privacy_mode = $1, updated_at = NOW()
          WHERE id = $2 AND deleted_at IS NULL",
     )
     .bind(new_val)
     .bind(user.user_id())
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ME_PRIVACY_SET,
+        "users",
+        Some(user.user_id()),
+        serde_json::json!({ "privacy_mode": new_val }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "set_privacy", "user={} privacy_mode={}", user.user_id(), new_val);
     Ok(HttpResponse::Ok().json(serde_json::json!({ "privacy_mode": new_val })))
 }
@@ -96,14 +108,27 @@ pub async fn set_home_address(
         return Err(ApiError::BadRequest("home_address required".into()));
     }
     let ciphertext = crypto::encrypt(&plaintext, &cfg.encryption.aes_256_key)?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE users SET home_address_enc = $1, updated_at = NOW()
          WHERE id = $2 AND deleted_at IS NULL",
     )
     .bind(&ciphertext)
     .bind(user.user_id())
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
+    // NOTE: never persist plaintext in the audit row — only a length signal so
+    // the trail shows *that* an address was written without leaking its value.
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ME_HOME_ADDRESS_SET,
+        "users",
+        Some(user.user_id()),
+        serde_json::json!({ "length": plaintext.len() }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "home_address_set", "user={} len={}", user.user_id(), plaintext.len());
     Ok(HttpResponse::Ok().json(HomeAddressResponse {
         home_address: Some(plaintext),

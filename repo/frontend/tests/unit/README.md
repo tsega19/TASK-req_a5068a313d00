@@ -1,22 +1,29 @@
 # Frontend unit tests
 
-The Yew app targets `wasm32-unknown-unknown`; native `cargo test` against
-`src/` would fail to compile because most modules depend on `web-sys`,
-`wasm-bindgen`, and `gloo-net` which require a browser environment.
+Executable unit tests live **inside the crate** as `#[cfg(test)]` modules that
+use [`wasm-bindgen-test`](https://rustwasm.github.io/wasm-bindgen/wasm-bindgen-test/usage.html).
+They run in a real browser (Chrome/Firefox) via `wasm-pack`.
 
-The idiomatic approach is [`wasm-bindgen-test`](https://rustwasm.github.io/wasm-bindgen/wasm-bindgen-test/usage.html)
-in headless-browser or Node mode. Integrating that runner into the Docker
-test pipeline requires either:
+## Run
 
-1. A headless browser (Chromium/Firefox) inside the container, driven by
-   `wasm-pack test --headless --chrome`.
-2. Node.js + `wasm-bindgen-test-runner --node` for DOM-free tests.
+From the repo root:
 
-Both add significant container build weight. The current phase satisfies
-the PRD's Frontend test requirement via `../e2e/smoke.sh`, which exercises
-the production bundle end-to-end against the running stack — the same
-surface a unit-test suite would cover indirectly via DOM assertions.
+```bash
+wasm-pack test --headless --chrome frontend
+```
 
-Pure-logic tests (`types.rs` role/state mappings, `auth.rs` localStorage
-roundtrip) can be added here in a follow-up by restructuring the crate
-into a `cfg(target_arch="wasm32")`-gated bin + a native-testable library.
+Or, without a browser, against Node:
+
+```bash
+wasm-pack test --node frontend
+```
+
+## Where the tests live
+
+- `frontend/src/types.rs` — role/state/status label + serde wire-tag guards.
+- `frontend/src/offline.rs` — mutation-queue enqueue/read, dead-letter flagging,
+  URI-encoding helpers used by the offline sync cursor.
+
+Add new tests alongside the module they cover so they run with the rest of the
+suite. For DOM-dependent tests keep `wasm_bindgen_test_configure!(run_in_browser)`
+at the top of the test module; for pure logic `--node` also works.

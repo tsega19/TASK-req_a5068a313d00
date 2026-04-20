@@ -47,6 +47,11 @@ web-sys = { version = "0.3", features = [
     "Coordinates",
 ]}
 
+[dev-dependencies]
+# Browser/Node-driven unit-test runner for the wasm target. Use via
+# `wasm-pack test --headless --chrome` or `wasm-bindgen-test-runner --node`.
+wasm-bindgen-test = "0.3"
+
 [profile.release]
 opt-level = "z"
 lto = true

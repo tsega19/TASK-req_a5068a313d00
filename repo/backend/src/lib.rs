@@ -24,8 +24,10 @@ pub mod me;
 pub mod middleware;
 pub mod notifications;
 pub mod pagination;
+pub mod processing_log;
 pub mod recipes;
 pub mod retention;
+pub mod sla;
 pub mod state_machine;
 pub mod sync;
 pub mod work_orders;
@@ -50,6 +52,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(learning::knowledge_scope())
         .service(learning::records_scope())
         .service(sync::routes::scope())
+        .service(location::scope())
         .service(admin::scope());
 }
 
@@ -112,6 +115,37 @@ pub fn spawn_notification_retry_worker(pool: sqlx::PgPool, cfg: config::AppConfi
                     r.skipped_backoff
                 ),
                 Err(e) => log_error!("boot", "notification_retry", "tick failed: {}", e),
+            }
+        }
+    });
+}
+
+/// Background SLA alert worker. Scans work orders on a cadence and enqueues
+/// in-app notifications when any configured threshold has been crossed (PRD §7).
+/// Deduplication happens inside `sla::scan_and_alert`.
+pub fn spawn_sla_alert_worker(pool: sqlx::PgPool, cfg: config::AppConfig) {
+    if cfg.business.sla_alert_thresholds.is_empty() {
+        log_warn!("boot", "sla_alert", "disabled (no thresholds configured)");
+        return;
+    }
+    actix_web::rt::spawn(async move {
+        // Scan every minute — cheap, and the dedup guard keeps notifications
+        // one-shot per threshold per work order.
+        let mut interval =
+            actix_web::rt::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match sla::scan_and_alert(&pool, &cfg).await {
+                Ok(r) => log_info!(
+                    "boot",
+                    "sla_alert",
+                    "tick scanned={} emitted={} deduped={}",
+                    r.scanned,
+                    r.alerts_emitted,
+                    r.deduped
+                ),
+                Err(e) => log_error!("boot", "sla_alert", "tick failed: {}", e),
             }
         }
     });

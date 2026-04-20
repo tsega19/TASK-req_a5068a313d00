@@ -1,8 +1,9 @@
+use gloo_net::http::Method;
 use yew::prelude::*;
 
-use crate::api;
 use crate::app::{toast_err, toast_ok, AuthCtx, ToastCtx};
 use crate::components::loading_button::LoadingButton;
+use crate::offline;
 use crate::types::{Notification, NotificationTemplate, Paginated};
 
 #[function_component(NotificationsPage)]
@@ -23,7 +24,9 @@ pub fn notifications_page() -> Html {
             loading.set(true);
             let state = auth.state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match api::get::<Paginated<Notification>>("/api/notifications", &state).await {
+                // Offline-first: cached notifications keep the list readable
+                // when the tablet is out of coverage.
+                match offline::get_cached::<Paginated<Notification>>("/api/notifications", &state).await {
                     Ok(r) => rows.set(Some(r)),
                     Err(e) => toast_err(&toasts, format!("Load failed: {}", e.message)),
                 }
@@ -44,7 +47,7 @@ pub fn notifications_page() -> Html {
             let reload_val = *reload;
             wasm_bindgen_futures::spawn_local(async move {
                 let url = format!("/api/notifications/{}/read", id);
-                match api::put::<_, serde_json::Value>(&url, &serde_json::json!({}), &state).await {
+                match offline::mutate_with_queue(Method::PUT, &url, &serde_json::json!({}), &state).await {
                     Ok(_) => reload.set(reload_val + 1),
                     Err(e) => toast_err(&toasts, e.message),
                 }
@@ -65,8 +68,9 @@ pub fn notifications_page() -> Html {
             let tpl_for_msg = tpl.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let body = serde_json::json!({ "template_type": tpl });
-                match api::put::<_, serde_json::Value>("/api/notifications/unsubscribe", &body, &state).await {
-                    Ok(_) => toast_ok(&toasts, format!("Unsubscribed from {}", tpl_for_msg.label())),
+                match offline::mutate_with_queue(Method::PUT, "/api/notifications/unsubscribe", &body, &state).await {
+                    Ok(Some(_)) => toast_ok(&toasts, format!("Unsubscribed from {}", tpl_for_msg.label())),
+                    Ok(None) => toast_ok(&toasts, format!("Unsubscribe queued for {}", tpl_for_msg.label())),
                     Err(e) => toast_err(&toasts, e.message),
                 }
                 unsubscribing.set(None);

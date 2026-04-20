@@ -11,6 +11,7 @@ use crate::enums::NotificationTemplate;
 use crate::errors::ApiError;
 use crate::middleware::rbac::AuthedUser;
 use crate::pagination::{PageParams, Paginated};
+use crate::processing_log;
 use crate::log_info;
 
 const MODULE: &str = "notifications";
@@ -68,6 +69,7 @@ pub async fn mark_read(
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, ApiError> {
     let id = path.into_inner();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, NotificationRow>(
         "UPDATE notifications SET read_at = NOW()
          WHERE id = $1 AND user_id = $2
@@ -75,9 +77,19 @@ pub async fn mark_read(
     )
     .bind(id)
     .bind(user.user_id())
-    .fetch_optional(pool.get_ref())
+    .fetch_optional(&mut *tx)
     .await?;
     let row = row.ok_or_else(|| ApiError::NotFound("notification not found".into()))?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::NOTIFICATION_READ,
+        "notifications",
+        Some(id),
+        serde_json::json!({ "template_type": row.template_type }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "mark_read", "user={} id={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(row))
 }
@@ -89,6 +101,7 @@ pub async fn unsubscribe(
     body: web::Json<UnsubscribeBody>,
 ) -> Result<HttpResponse, ApiError> {
     let template = body.template_type;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO notification_unsubscribes (user_id, template_type)
          VALUES ($1, $2)
@@ -96,8 +109,18 @@ pub async fn unsubscribe(
     )
     .bind(user.user_id())
     .bind(template)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::NOTIFICATION_UNSUBSCRIBE,
+        "notification_unsubscribes",
+        None,
+        serde_json::json!({ "template_type": template }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "unsubscribe", "user={} template={:?}", user.user_id(), template);
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true, "template_type": template })))
 }

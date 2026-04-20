@@ -1,14 +1,15 @@
+use gloo_net::http::Method;
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use crate::api;
 use crate::app::{toast_err, toast_ok, AuthCtx, ToastCtx};
 use crate::components::loading_button::LoadingButton;
 use crate::components::sla::SlaCountdown;
 use crate::components::state_badge::{PriorityBadge, StateBadge};
+use crate::offline;
 use crate::routes::Route;
 use crate::types::{DataEnvelope, RecipeStep, StepProgress, StepProgressStatus, WorkOrder, WorkOrderState};
 
@@ -41,13 +42,14 @@ pub fn work_order_detail(props: &DetailProps) -> Html {
             let state = auth.state.clone();
             loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                // Work order
-                match api::get::<WorkOrder>(&format!("/api/work-orders/{}", id), &state).await {
+                // Offline-first reads: cached GETs keep the detail view usable
+                // even when the technician's tablet drops connectivity mid-job.
+                match offline::get_cached::<WorkOrder>(&format!("/api/work-orders/{}", id), &state).await {
                     Ok(w) => {
                         let recipe_id = w.recipe_id;
                         wo.set(Some(w));
                         if let Some(rid) = recipe_id {
-                            if let Ok(env) = api::get::<DataEnvelope<RecipeStep>>(
+                            if let Ok(env) = offline::get_cached::<DataEnvelope<RecipeStep>>(
                                 &format!("/api/recipes/{}/steps", rid),
                                 &state,
                             )
@@ -56,7 +58,7 @@ pub fn work_order_detail(props: &DetailProps) -> Html {
                                 steps.set(env.data);
                             }
                         }
-                        if let Ok(env) = api::get::<DataEnvelope<StepProgress>>(
+                        if let Ok(env) = offline::get_cached::<DataEnvelope<StepProgress>>(
                             &format!("/api/work-orders/{}/progress", id),
                             &state,
                         )
@@ -257,9 +259,16 @@ fn check_in_panel(props: &CheckInPanelProps) -> Html {
                     "lng": lng,
                 });
                 let url = format!("/api/work-orders/{}/check-in", id);
-                match api::post::<_, serde_json::Value>(&url, &body, &state).await {
-                    Ok(_) => {
+                // mutate_with_queue returns Ok(None) when the request was
+                // deferred to the offline queue — surface that distinctly so
+                // the tech knows the write will converge on reconnect.
+                match offline::mutate_with_queue(Method::POST, &url, &body, &state).await {
+                    Ok(Some(_)) => {
                         toast_ok(&toasts, format!("{} check-in recorded", kind));
+                        on_changed.emit(());
+                    }
+                    Ok(None) => {
+                        toast_ok(&toasts, format!("{} check-in queued (offline)", kind));
                         on_changed.emit(());
                     }
                     Err(e) => toast_err(&toasts, e.message),
@@ -417,9 +426,13 @@ fn transition_panel(props: &TransitionPanelProps) -> Html {
                     "lng": lng,
                 });
                 let url = format!("/api/work-orders/{}/state", id);
-                match api::put::<_, serde_json::Value>(&url, &body, &state).await {
-                    Ok(_) => {
+                match offline::mutate_with_queue(Method::PUT, &url, &body, &state).await {
+                    Ok(Some(_)) => {
                         toast_ok(&toasts, format!("Moved to {:?}", to));
+                        on_changed.emit(());
+                    }
+                    Ok(None) => {
+                        toast_ok(&toasts, format!("{:?} transition queued (offline)", to));
                         on_changed.emit(());
                     }
                     Err(e) => toast_err(&toasts, e.message),
@@ -477,7 +490,7 @@ struct TimelineProps {
     wo_id: Uuid,
 }
 
-#[derive(Clone, PartialEq, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct TimelineEntry {
     from_state: Option<String>,
     to_state: String,
@@ -485,7 +498,7 @@ struct TimelineEntry {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Clone, PartialEq, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct TimelineResp {
     data: Vec<TimelineEntry>,
 }
@@ -501,7 +514,7 @@ fn timeline(props: &TimelineProps) -> Html {
         use_effect_with(id, move |_| {
             let state = auth.state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(r) = api::get::<TimelineResp>(
+                if let Ok(r) = offline::get_cached::<TimelineResp>(
                     &format!("/api/work-orders/{}/timeline", id),
                     &state,
                 )
@@ -533,3 +546,37 @@ fn timeline(props: &TimelineProps) -> Html {
         </div>
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    // Configure is centralized in types.rs; see the note there.
+
+    #[wasm_bindgen_test]
+    fn parse_coord_returns_none_for_empty_input() {
+        // The check-in and transition forms treat blank fields as "not set"
+        // so the downstream validator can fail fast with a clear message.
+        assert_eq!(parse_coord(""), None);
+        assert_eq!(parse_coord("   "), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_coord_accepts_signed_decimals() {
+        assert_eq!(parse_coord("37.7749"),  Some(37.7749));
+        assert_eq!(parse_coord("-122.4194"), Some(-122.4194));
+        assert_eq!(parse_coord("0"),         Some(0.0));
+        // Surrounding whitespace is tolerated — technicians paste values from
+        // the map panel, which sometimes includes a trailing space.
+        assert_eq!(parse_coord("  12.5 "),   Some(12.5));
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_coord_rejects_garbage() {
+        assert_eq!(parse_coord("north"),  None);
+        assert_eq!(parse_coord("12.3.4"), None);
+        assert_eq!(parse_coord("12,3"),   None); // comma decimal — locale mismatch
+    }
+}
+

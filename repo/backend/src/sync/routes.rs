@@ -149,9 +149,19 @@ pub async fn list_changes(
     pool: web::Data<PgPool>,
     q: web::Query<ChangesQuery>,
 ) -> Result<HttpResponse, ApiError> {
-    // Any authenticated role may pull — it returns only tombstones and etags,
-    // not business data. Scope is enforced on the follow-up reads that fetch
-    // the referenced rows (load_visible etc.).
+    // The changes feed is scoped to what the caller can already see on the
+    // read side — otherwise a TECH could enumerate entity_ids belonging to
+    // other branches via sync_log metadata alone, even though the follow-up
+    // reads would 404. Scoping rules mirror load_visible for work orders:
+    //
+    //   - ADMIN: full feed.
+    //   - SUPER: work_order rows within their branch (plus branch-less),
+    //            plus job_step_progress rows attached to those work orders,
+    //            plus global recipe/tip-card rows (not branch-scoped).
+    //   - TECH:  only rows for entities they are assigned to (work orders
+    //            + progress rows); recipes/tip-cards tied to those WOs.
+    //
+    // This keeps `/api/sync/changes` from leaking cross-scope UUIDs.
     let q = q.into_inner();
     let since = match q.since.as_deref() {
         None => None,
@@ -163,20 +173,89 @@ pub async fn list_changes(
     };
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
 
-    let rows = sqlx::query_as::<_, ChangeRow>(
-        "SELECT id, entity_table, entity_id, operation::text AS operation,
-                old_etag, new_etag, synced_at, conflict_flagged
-         FROM sync_log
-         WHERE ($1::timestamptz IS NULL OR synced_at > $1)
-           AND ($2::text IS NULL OR entity_table = $2)
-         ORDER BY synced_at ASC
-         LIMIT $3",
-    )
-    .bind(since)
-    .bind(q.entity.as_deref())
-    .bind(limit)
-    .fetch_all(pool.get_ref())
-    .await?;
+    let rows: Vec<ChangeRow> = match user.role() {
+        Role::Admin => sqlx::query_as::<_, ChangeRow>(
+            "SELECT id, entity_table, entity_id, operation::text AS operation,
+                    old_etag, new_etag, synced_at, conflict_flagged
+             FROM sync_log
+             WHERE ($1::timestamptz IS NULL OR synced_at > $1)
+               AND ($2::text IS NULL OR entity_table = $2)
+             ORDER BY synced_at ASC
+             LIMIT $3",
+        )
+        .bind(since)
+        .bind(q.entity.as_deref())
+        .bind(limit)
+        .fetch_all(pool.get_ref())
+        .await?,
+
+        Role::Super => sqlx::query_as::<_, ChangeRow>(
+            "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
+                    s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
+             FROM sync_log s
+             WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
+               AND ($2::text IS NULL OR s.entity_table = $2)
+               AND (
+                 s.entity_table IN ('recipes', 'tip_cards')
+                 OR (
+                   s.entity_table = 'work_orders' AND EXISTS (
+                     SELECT 1 FROM work_orders w
+                     WHERE w.id = s.entity_id
+                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
+                   )
+                 )
+                 OR (
+                   s.entity_table = 'job_step_progress' AND EXISTS (
+                     SELECT 1 FROM job_step_progress p
+                     JOIN work_orders w ON w.id = p.work_order_id
+                     WHERE p.id = s.entity_id
+                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
+                   )
+                 )
+               )
+             ORDER BY s.synced_at ASC
+             LIMIT $4",
+        )
+        .bind(since)
+        .bind(q.entity.as_deref())
+        .bind(user.branch_id())
+        .bind(limit)
+        .fetch_all(pool.get_ref())
+        .await?,
+
+        Role::Tech => sqlx::query_as::<_, ChangeRow>(
+            "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
+                    s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
+             FROM sync_log s
+             WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
+               AND ($2::text IS NULL OR s.entity_table = $2)
+               AND (
+                 s.entity_table = 'recipes'
+                 OR s.entity_table = 'tip_cards'
+                 OR (
+                   s.entity_table = 'work_orders' AND EXISTS (
+                     SELECT 1 FROM work_orders w
+                     WHERE w.id = s.entity_id AND w.assigned_tech_id = $3
+                   )
+                 )
+                 OR (
+                   s.entity_table = 'job_step_progress' AND EXISTS (
+                     SELECT 1 FROM job_step_progress p
+                     JOIN work_orders w ON w.id = p.work_order_id
+                     WHERE p.id = s.entity_id AND w.assigned_tech_id = $3
+                   )
+                 )
+               )
+             ORDER BY s.synced_at ASC
+             LIMIT $4",
+        )
+        .bind(since)
+        .bind(q.entity.as_deref())
+        .bind(user.user_id())
+        .bind(limit)
+        .fetch_all(pool.get_ref())
+        .await?,
+    };
 
     // Cursor: max synced_at in returned rows, or echoed input.
     let next_cursor = rows
@@ -188,8 +267,9 @@ pub async fn list_changes(
     log_info!(
         MODULE,
         "changes",
-        "user={} since={:?} entity={:?} count={}",
+        "user={} role={} since={:?} entity={:?} count={}",
         user.user_id(),
+        user.role(),
         q.since,
         q.entity,
         rows.len()

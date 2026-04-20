@@ -1,15 +1,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gloo_net::http::Method;
 use uuid::Uuid;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
-use crate::api;
 use crate::app::{toast_err, toast_ok, AuthCtx, ToastCtx};
 use crate::components::loading_button::LoadingButton;
 use crate::components::map_svg::MapSvg;
+use crate::offline;
 use crate::types::{Profile, TrailPoint, WorkOrder};
 
 #[derive(Properties, PartialEq)]
@@ -17,7 +18,7 @@ pub struct MapProps {
     pub id: Uuid,
 }
 
-#[derive(Clone, PartialEq, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct TrailResp {
     data: Vec<TrailPoint>,
     #[serde(default)]
@@ -49,10 +50,12 @@ pub fn map_view_page(props: &MapProps) -> Html {
         use_effect_with(dep, move |_| {
             let state = auth.state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(w) = api::get::<WorkOrder>(&format!("/api/work-orders/{}", id), &state).await {
+                // Offline-first reads so the map still shows last-known trail
+                // points and pin location during a network drop.
+                if let Ok(w) = offline::get_cached::<WorkOrder>(&format!("/api/work-orders/{}", id), &state).await {
                     wo.set(Some(w));
                 }
-                match api::get::<TrailResp>(
+                match offline::get_cached::<TrailResp>(
                     &format!("/api/work-orders/{}/location-trail", id),
                     &state,
                 )
@@ -64,7 +67,7 @@ pub fn map_view_page(props: &MapProps) -> Html {
                     }
                     Err(e) => toast_err(&toasts, format!("Trail load failed: {}", e.message)),
                 }
-                if let Ok(p) = api::get::<Profile>("/api/me", &state).await {
+                if let Ok(p) = offline::get_cached::<Profile>("/api/me", &state).await {
                     profile.set(Some(p));
                 }
             });
@@ -93,20 +96,24 @@ pub fn map_view_page(props: &MapProps) -> Html {
             let reload_val = *reload;
             wasm_bindgen_futures::spawn_local(async move {
                 let body = serde_json::json!({ "privacy_mode": new_val });
-                match api::put::<_, serde_json::Value>("/api/me/privacy", &body, &state).await {
-                    Ok(_) => {
+                match offline::mutate_with_queue(Method::PUT, "/api/me/privacy", &body, &state).await {
+                    Ok(applied) => {
                         if let Some(mut p) = (*profile).clone() {
                             p.privacy_mode = new_val;
                             profile.set(Some(p));
                         }
-                        toast_ok(
-                            &toasts,
+                        let msg = if applied.is_none() {
                             if new_val {
-                                "Privacy mode ON — trail precision reduced."
+                                "Privacy ON (queued — syncs on reconnect)"
                             } else {
-                                "Privacy mode OFF — full trail precision."
-                            },
-                        );
+                                "Privacy OFF (queued — syncs on reconnect)"
+                            }
+                        } else if new_val {
+                            "Privacy mode ON — trail precision reduced."
+                        } else {
+                            "Privacy mode OFF — full trail precision."
+                        };
+                        toast_ok(&toasts, msg);
                         reload.set(reload_val + 1);
                     }
                     Err(e) => toast_err(&toasts, e.message),
@@ -167,14 +174,18 @@ pub fn map_view_page(props: &MapProps) -> Html {
                 wasm_bindgen_futures::spawn_local(async move {
                     let body = serde_json::json!({ "lat": lat, "lng": lng });
                     let url = format!("/api/work-orders/{}/location-trail", id);
-                    match api::post::<_, serde_json::Value>(&url, &body, &state).await {
-                        Ok(_) => {
+                    match offline::mutate_with_queue(Method::POST, &url, &body, &state).await {
+                        Ok(Some(_)) => {
                             let msg = if source == "device" {
                                 "Trail point recorded from device location"
                             } else {
                                 "Trail point recorded (offline fallback)"
                             };
                             toast_ok(&toasts, msg);
+                            reload.set(reload_val + 1);
+                        }
+                        Ok(None) => {
+                            toast_ok(&toasts, "Trail point queued (offline)");
                             reload.set(reload_val + 1);
                         }
                         Err(e) => toast_err(&toasts, e.message),

@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod auth;
 mod components;
+mod offline;
 mod pages;
 mod routes;
 mod types;

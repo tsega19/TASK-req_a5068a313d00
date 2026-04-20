@@ -190,3 +190,98 @@ async fn change_password_requires_bearer() {
         .to_request();
     assert_eq!(status_of(&app, req).await, 401);
 }
+
+// -----------------------------------------------------------------------------
+// PRD §6 password-reset gate — must be enforced server-side, not just
+// advertised in the login response (audit High #1 / Medium #4).
+// -----------------------------------------------------------------------------
+
+#[actix_web::test]
+async fn reset_required_blocks_privileged_routes() {
+    let ctx = setup().await;
+    // Flag the admin's row — simulates the seeded default admin boot path.
+    sqlx::query("UPDATE users SET password_reset_required = TRUE WHERE id = $1")
+        .bind(ctx.admin_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    let app = make_service(&ctx).await;
+
+    // Any privileged route must deny while the flag is set.
+    let req = TestRequest::get()
+        .uri("/api/work-orders")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "password_reset_required");
+
+    // Admin-only routes are also blocked — not just generic ones.
+    let app2 = make_service(&ctx).await;
+    let req2 = TestRequest::get()
+        .uri("/api/admin/users")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    assert_eq!(status_of(&app2, req2).await, 403);
+}
+
+#[actix_web::test]
+async fn reset_required_allows_change_password_and_logout() {
+    let ctx = setup().await;
+    sqlx::query("UPDATE users SET password_reset_required = TRUE WHERE id = $1")
+        .bind(ctx.admin_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    // Logout is exempt so the client can still drop a session cleanly.
+    let app = make_service(&ctx).await;
+    let logout = TestRequest::post()
+        .uri("/api/auth/logout")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    assert_eq!(status_of(&app, logout).await, 200);
+
+    // change-password is the whole point of the gate — must succeed.
+    let app2 = make_service(&ctx).await;
+    let rotate = TestRequest::post()
+        .uri("/api/auth/change-password")
+        .insert_header(auth_header(&ctx.admin_token))
+        .set_json(json!({
+            "current_password": "pw",
+            "new_password": "a-brand-new-long-enough-password"
+        }))
+        .to_request();
+    assert_eq!(status_of(&app2, rotate).await, 200);
+}
+
+#[actix_web::test]
+async fn reset_required_lifts_after_password_change() {
+    let ctx = setup().await;
+    sqlx::query("UPDATE users SET password_reset_required = TRUE WHERE id = $1")
+        .bind(ctx.admin_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    // Rotate the password first.
+    let app = make_service(&ctx).await;
+    let rotate = TestRequest::post()
+        .uri("/api/auth/change-password")
+        .insert_header(auth_header(&ctx.admin_token))
+        .set_json(json!({
+            "current_password": "pw",
+            "new_password": "a-brand-new-long-enough-password"
+        }))
+        .to_request();
+    assert_eq!(status_of(&app, rotate).await, 200);
+
+    // Now the privileged route should unblock under the same token.
+    let app2 = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/admin/users")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    assert_eq!(status_of(&app2, req).await, 200);
+}

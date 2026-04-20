@@ -234,3 +234,161 @@ async fn analytics_role_filter_limits_to_requested_role() {
         assert_eq!(r["role"], "TECH");
     }
 }
+
+// -----------------------------------------------------------------------------
+// Trend endpoints: /api/analytics/trends/{knowledge-points,units,workflows}.
+// Guard against the newly-added trend builder regressing silently.
+// -----------------------------------------------------------------------------
+
+/// Seeds one pass (quiz_score=1.0) and one fail (quiz_score=0.0) on the same
+/// knowledge point for the given user — enough to verify both completion
+/// counting and the completion_rate metric end-to-end.
+async fn seed_pass_and_fail(
+    pool: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    recipe: uuid::Uuid,
+    work_order_id: uuid::Uuid,
+) -> uuid::Uuid {
+    let kp: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO knowledge_points (recipe_id, title) VALUES ($1, 'Trend KP') RETURNING id",
+    )
+    .bind(recipe)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    // One pass, one fail — completion_rate should resolve to 0.5.
+    for score in [1.0f64, 0.0f64] {
+        sqlx::query(
+            "INSERT INTO learning_records (user_id, knowledge_point_id, work_order_id,
+                quiz_score, time_spent_seconds, review_count, completed_at)
+             VALUES ($1, $2, $3, $4, 60, 0, NOW())",
+        )
+        .bind(user_id)
+        .bind(kp)
+        .bind(work_order_id)
+        .bind(score)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    kp
+}
+
+#[actix_web::test]
+async fn trends_knowledge_points_reports_completion_rate() {
+    let ctx = setup().await;
+    let kp = seed_pass_and_fail(&ctx.pool, ctx.tech_a_id, ctx.recipe_id, ctx.wo_a_id).await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/knowledge-points")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let row = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["group_id"] == kp.to_string())
+        .expect("seeded KP must appear in trend output");
+    assert_eq!(row["attempt_count"].as_i64().unwrap(), 2);
+    assert_eq!(row["completion_count"].as_i64().unwrap(), 1);
+    let rate = row["completion_rate"].as_f64().unwrap();
+    assert!((rate - 0.5).abs() < 1e-9, "completion_rate should be 0.5, got {}", rate);
+    assert_eq!(row["group_label"].as_str().unwrap(), "Trend KP");
+}
+
+#[actix_web::test]
+async fn trends_units_groups_by_recipe() {
+    let ctx = setup().await;
+    let _ = seed_pass_and_fail(&ctx.pool, ctx.tech_a_id, ctx.recipe_id, ctx.wo_a_id).await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/units")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let row = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["group_id"] == ctx.recipe_id.to_string())
+        .expect("seed recipe must appear as a unit group");
+    assert!(row["attempt_count"].as_i64().unwrap() >= 2);
+    assert!(row["completion_count"].as_i64().unwrap() >= 1);
+    assert_eq!(row["group_label"].as_str().unwrap(), "Refrigeration Service");
+}
+
+#[actix_web::test]
+async fn trends_workflows_groups_by_work_order() {
+    let ctx = setup().await;
+    let _ = seed_pass_and_fail(&ctx.pool, ctx.tech_a_id, ctx.recipe_id, ctx.wo_a_id).await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/workflows")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let row = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["group_id"] == ctx.wo_a_id.to_string())
+        .expect("seed work_order must appear as a workflow group");
+    assert_eq!(row["attempt_count"].as_i64().unwrap(), 2);
+    assert_eq!(row["completion_count"].as_i64().unwrap(), 1);
+}
+
+#[actix_web::test]
+async fn trends_respect_tech_scope() {
+    let ctx = setup().await;
+    // Seed records for both tech_a and tech_b so a wrong scope would pick up
+    // foreign rows.
+    let _ = seed_pass_and_fail(&ctx.pool, ctx.tech_a_id, ctx.recipe_id, ctx.wo_a_id).await;
+    let _ = seed_pass_and_fail(&ctx.pool, ctx.tech_b_id, ctx.recipe_id, ctx.wo_b_id).await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/workflows")
+        .insert_header(auth_header(&ctx.tech_a_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    // TECH must see only their own work_order, never the other branch's.
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["group_id"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(ids.contains(&ctx.wo_a_id.to_string()));
+    assert!(!ids.contains(&ctx.wo_b_id.to_string()), "TECH must not see other tech's WO");
+}
+
+#[actix_web::test]
+async fn trends_rejects_invalid_bucket() {
+    let ctx = setup().await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/knowledge-points?bucket=fortnight")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    assert_eq!(status_of(&app, req).await, 400);
+}
+
+#[actix_web::test]
+async fn trends_week_bucket_returns_bucket_start() {
+    let ctx = setup().await;
+    let _ = seed_pass_and_fail(&ctx.pool, ctx.tech_a_id, ctx.recipe_id, ctx.wo_a_id).await;
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/analytics/trends/knowledge-points?bucket=week")
+        .insert_header(auth_header(&ctx.admin_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let row = &body["data"].as_array().unwrap()[0];
+    // With a bucket set, bucket_start must be populated (not null).
+    assert!(row["bucket_start"].is_string());
+}

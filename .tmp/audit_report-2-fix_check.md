@@ -1,67 +1,115 @@
-# Recheck Report (Static-Only) — “Left issues” follow-up
+## Re-Audit Fix Check Report (Round 2)
 
-Date: 2026-04-18  
-Boundary: static inspection only (no execution).
+Source under review: `.tmp/audit_report.md`
+Output target: `.tmp/audit_report-2-fix_check.md`
+Audit mode: Static-only (no runtime execution, no tests run)
 
-## Summary
+### 1) Verdict
+Overall conclusion: **Partial Pass**
 
-### Fixed (confirmed by static evidence)
-
-1) **Learning pipeline now exists (knowledge points + learning record capture)**
-- Evidence (routes registered): `repo/backend/src/lib.rs:50`
-- Evidence (API implementation): `repo/backend/src/learning/routes.rs:102` (knowledge points), `repo/backend/src/learning/routes.rs:271` (record capture)
-- Evidence (tests exist): `repo/backend/tests/api/learning.rs:6`
-- Notes: Includes “hide correct answer from TECH” behavior. Evidence: `repo/backend/src/learning/routes.rs:41`, tested at `repo/backend/tests/api/learning.rs:55`.
-
-2) **Analytics now has meaningful tests (filters + watermark + pipeline)**
-- Evidence (tests): `repo/backend/tests/api/analytics.rs:26` (scoping), `repo/backend/tests/api/analytics.rs:66` (date format), `repo/backend/tests/api/analytics.rs:77` (CSV watermark), `repo/backend/tests/api/analytics.rs:110` (records written via capture endpoint appear in analytics)
-
-3) **Sync API expanded to include a “changes since cursor” pull surface + delete propagation**
-- Evidence (endpoint): `GET /api/sync/changes`: `repo/backend/src/sync/routes.rs:146`
-- Evidence (delete propagation endpoint): `POST /api/sync/work-orders/{id}/delete`: `repo/backend/src/sync/routes.rs:209`
-
-4) **Notification retry worker and ad-hoc admin trigger exist (still stub delivery, but retries/bookkeeping exist)**
-- Evidence (retry worker spawn): `repo/backend/src/main.rs:32`
-- Evidence (retry implementation): `repo/backend/src/notifications/stub.rs:158`
-- Evidence (admin trigger endpoint): `repo/backend/src/admin/routes.rs:326`
-
-5) **Retention pruning worker and admin trigger exist (but see “Not fixed / new blocker” below)**
-- Evidence (worker spawn): `repo/backend/src/main.rs:33`
-- Evidence (prune logic): `repo/backend/src/retention.rs:39`
-- Evidence (admin trigger endpoint): `repo/backend/src/admin/routes.rs:307`
+Reason: The four previously reported implementation gaps from Round 2 are statically addressed in code. However, several claims in `.tmp/audit_report.md` are written as runtime verification steps and cannot be confirmed statistically in this re-audit.
 
 ---
 
-### Not fixed (still failing by static evidence)
+### 2) Scope and Static Boundary
+Reviewed:
+- Fix summary document: `.tmp/audit_report.md`
+- Backend implementation areas for claimed fixes:
+  - `backend/src/analytics/routes.rs`
+  - `backend/src/admin/routes.rs`
+  - `backend/src/work_orders/routes.rs`
+  - `backend/src/learning/routes.rs`
+  - `backend/src/location/routes.rs`
+  - `backend/config/mod.rs`
+- Frontend implementation area:
+  - `frontend/src/pages/analytics.rs`
+- Relevant static tests:
+  - `backend/tests/api/*.rs` (targeted files)
 
-1) **README hard-gate failures remain**
-- Missing explicit project type declaration (backend/fullstack/etc.) near top: `repo/README.md:1`
-- Missing explicit access URLs (e.g., `http://localhost:8081`, `http://localhost:8080`): `repo/README.md:13`
-- Missing explicit verification steps (curl/UI flow): `repo/README.md:21`
-- Missing demo credentials guidance for non-admin roles (SUPER/TECH) or explicit “how to create”: `repo/README.md:27`
-- Encoding corruption still present (garbled characters): `repo/README.md:11`, `repo/README.md:29`, `repo/README.md:58`
+Not executed intentionally:
+- Project runtime, UI interaction, Docker, external services
+- Test execution
 
-Conclusion: README audit is still **FAIL** under the criteria in `.tmp/test_coverage_and_readme_audit_report.md:313` and `.tmp/test_coverage_and_readme_audit_report.md:334`.
+Manual verification required for:
+- Live API behavior and UI rendering/interaction claims stated in `.tmp/audit_report.md:8,18,27,37`
 
 ---
 
-### Blocker / Consistency defect (new or still present)
+### 3) Re-Audit of Prior Round-2 Issues
 
-1) **Retention pruning claims a DB trigger bypass that is not implemented in migrations**
-- `retention.rs` claims migration “0002 teaches the immutability trigger to honour … `fieldops.retention_prune`”: `repo/backend/src/retention.rs:6`
-- Actual `0002_security.sql` only adds `users.password_reset_required` and does NOT modify the immutability trigger: `repo/backend/migrations/0002_security.sql:1`
-- The immutability trigger always raises on DELETE/UPDATE of `work_order_transitions`: `repo/backend/migrations/0001_init.sql:177`
+#### Issue 1: Analytics trend granularity
+Status: **RESOLVED (static evidence)**
 
-Impact (static reasoning):
-- `work_order_transitions` is `ON DELETE CASCADE` from `work_orders`: `repo/backend/migrations/0001_init.sql:166`.
-- A retention worker that hard-deletes old soft-deleted work orders (`DELETE FROM work_orders …`) will attempt cascaded DELETEs on `work_order_transitions`, which should trigger `BEFORE DELETE` and raise, potentially blocking retention pruning whenever transitions exist.
-- This is a material discrepancy between code comments/intent and schema behavior.
+Evidence:
+- Trend models/query builder implemented: `backend/src/analytics/routes.rs:250`
+- Trend endpoints present:
+  - `GET /trends/knowledge-points`: `backend/src/analytics/routes.rs:343`
+  - `GET /trends/units`: `backend/src/analytics/routes.rs:355`
+  - `GET /trends/workflows`: `backend/src/analytics/routes.rs:367`
+- Route registration includes trend endpoints: `backend/src/analytics/routes.rs:383-385`
+- Frontend trends UI panel and API path usage:
+  - Panel component: `frontend/src/pages/analytics.rs:328`
+  - endpoint path build: `frontend/src/pages/analytics.rs:392-394`
+  - run action: `frontend/src/pages/analytics.rs:431`
 
-Minimum actionable fix (for implementers; not executed here):
-- Update migrations to implement the claimed bypass (e.g., adjust `wot_immutable()` to allow DELETE when `current_setting('fieldops.retention_prune', true) = 'on'`), and add an integration test that:
-  - creates a work order + transition rows,
-  - soft-deletes it,
-  - sets `deleted_at` back in time,
-  - runs retention prune,
-  - confirms the work order and transitions are removed.
+Notes:
+- Static tests still appear focused on `/api/analytics/learning` rather than new trend endpoints (`backend/tests/api/analytics.rs:33,55,82,148`), so regression risk remains if trend query logic changes.
 
+#### Issue 2: Notification template emission paths
+Status: **RESOLVED (static evidence)**
+
+Evidence:
+- Signup success emission on user create: `backend/src/admin/routes.rs:132`
+- Cancellation emission on work-order cancel transition: `backend/src/work_orders/routes.rs:489-503`
+- Review result emission on graded learning record: `backend/src/learning/routes.rs:402-415`
+- Existing schedule-change path remains: `backend/src/sla.rs:154`
+
+Notes:
+- Existing notification tests cover notification subsystem behavior broadly (`backend/tests/api/notifications.rs`), but no clear direct test asserts each new domain-triggered template emission path in admin/work-order/learning handlers.
+
+#### Issue 3: Geocode fallback strictness
+Status: **RESOLVED (static evidence)**
+
+Evidence:
+- New config gate field and env wiring:
+  - field: `backend/config/mod.rs:111`
+  - env parse: `backend/config/mod.rs:268`
+- Strict-mode rejection in location geocode route: `backend/src/location/routes.rs:311`
+- Strict-mode rejection in work-order create geocode flow: `backend/src/work_orders/routes.rs:189-193`
+
+Notes:
+- Geocoding tests verify index resolution and RBAC (`backend/tests/api/geocoding.rs:37-49,52-61`) but do not clearly assert `ALLOW_GEOCODE_FALLBACK=false` strict-path rejection behavior.
+
+#### Issue 4: Branch filter UX/validation
+Status: **RESOLVED (static evidence)**
+
+Evidence:
+- UUID validation helper: `frontend/src/pages/analytics.rs:14`
+- Validation toasts before run/export:
+  - run: `frontend/src/pages/analytics.rs:132-133`
+  - export: `frontend/src/pages/analytics.rs:167-168`
+- Branch list fetch and selector-backed UX (with fallback text input): `frontend/src/pages/analytics.rs` (branch loading + panel rendering; includes selector path use and trends integration at `328+` and request shaping near `392-394`).
+
+---
+
+### 4) Material Observations on the Fix Report Itself
+
+1. **Runtime-proof language exceeds static boundary**  
+   Conclusion: **Cannot Confirm Statistically**  
+   Evidence: `.tmp/audit_report.md:8,18,27,37`  
+   Impact: The document presents execution outcomes (curl/UI/DB checks) as completed proof, but this re-audit cannot validate those runtime claims.
+
+2. **Test coverage lag on newly added fix paths**  
+   Conclusion: **Medium**  
+   Evidence:
+- Analytics tests target `/api/analytics/learning` only: `backend/tests/api/analytics.rs:33,55,82,148`
+- Geocode tests do not show strict fallback-off case: `backend/tests/api/geocoding.rs:37-49,52-61`
+- Notification tests focus on notification APIs/worker behavior, not all newly added domain emission points: `backend/tests/api/notifications.rs:19-350`
+   Impact: Severe regressions in new fix logic may pass existing tests undetected.
+
+---
+
+### 5) Final Re-Audit Judgment
+- Prior Round-2 defects appear **implemented and addressed statically**.
+- Remaining risk is primarily **verification depth** (runtime claims in the fix document and missing targeted tests for some newly added paths).
+- Final status for this fix-check cycle: **Partial Pass**.

@@ -226,7 +226,9 @@ async fn merge_higher_version_wins_deterministically() {
 }
 
 #[actix_web::test]
-async fn merge_equal_version_conflict_flagged_for_super() {
+async fn merge_equal_version_equal_timestamp_conflict_flagged_for_super() {
+    // With timestamp-priority in place, only a *strictly equal* timestamp +
+    // equal version + divergent payload is ambiguous enough to escalate.
     use fieldops_backend::enums::StepProgressStatus;
     use fieldops_backend::sync::merge::{merge_step_progress, IncomingProgress, MergeOutcome};
 
@@ -248,10 +250,13 @@ async fn merge_equal_version_conflict_flagged_for_super() {
         "INSERT INTO work_orders (title, priority, state, assigned_tech_id, branch_id, recipe_id, version_count)
          VALUES ('WO','NORMAL','InProgress',$1,$2,$3,1) RETURNING id",
     ).bind(tech).bind(branch).bind(recipe).fetch_one(&pool).await.unwrap();
+
+    // Pin the local updated_at so the incoming can match it exactly.
+    let ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
     sqlx::query(
-        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version)
-         VALUES ($1,$2,'InProgress','from device A',2)",
-    ).bind(wo).bind(step).execute(&pool).await.unwrap();
+        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1,$2,'InProgress','from device A',2,$3)",
+    ).bind(wo).bind(step).bind(ts).execute(&pool).await.unwrap();
 
     let incoming = IncomingProgress {
         work_order_id: wo, step_id: step,
@@ -259,7 +264,7 @@ async fn merge_equal_version_conflict_flagged_for_super() {
         notes: Some("from device B".into()),
         timer_state_snapshot: None,
         version: 2,
-        updated_at: chrono::Utc::now(),
+        updated_at: ts,
     };
     assert_eq!(merge_step_progress(&pool, &incoming).await.unwrap(), MergeOutcome::Conflict);
     let flagged: i64 = sqlx::query_scalar(
@@ -267,6 +272,261 @@ async fn merge_equal_version_conflict_flagged_for_super() {
          WHERE entity_id = $1 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
     ).bind(step).fetch_one(&pool).await.unwrap();
     assert_eq!(flagged, 1);
+}
+
+#[actix_web::test]
+async fn merge_equal_version_newer_timestamp_applies_deterministically() {
+    // PRD §8 timestamp-priority rule: equal version + later incoming timestamp
+    // must overwrite the local row deterministically (not escalate).
+    use fieldops_backend::enums::StepProgressStatus;
+    use fieldops_backend::sync::merge::{merge_step_progress, IncomingProgress, MergeOutcome};
+
+    let pool = fresh().await;
+    let branch: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO branches (name, lat, lng) VALUES ('B', 37.0, -122.0) RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let tech: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, role, branch_id)
+         VALUES ('tech', 'x', 'TECH', $1) RETURNING id",
+    ).bind(branch).fetch_one(&pool).await.unwrap();
+    let recipe: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipes (name) VALUES ('R') RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipe_steps (recipe_id, step_order, title) VALUES ($1, 1, 'S') RETURNING id",
+    ).bind(recipe).fetch_one(&pool).await.unwrap();
+    let wo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_orders (title, priority, state, assigned_tech_id, branch_id, recipe_id, version_count)
+         VALUES ('WO','NORMAL','InProgress',$1,$2,$3,1) RETURNING id",
+    ).bind(tech).bind(branch).bind(recipe).fetch_one(&pool).await.unwrap();
+
+    // Keep notes identical on both sides so the divergence is purely on
+    // `status` — otherwise the dual-notes invariant would escalate instead
+    // of exercising timestamp-priority.
+    let local_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1,$2,'InProgress','shared note',2,$3)",
+    ).bind(wo).bind(step).bind(local_ts).execute(&pool).await.unwrap();
+
+    let newer_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:30:00Z".parse().unwrap();
+    let incoming = IncomingProgress {
+        work_order_id: wo, step_id: step,
+        status: StepProgressStatus::Paused,
+        notes: Some("shared note".into()),
+        timer_state_snapshot: None,
+        version: 2,
+        updated_at: newer_ts,
+    };
+    assert_eq!(merge_step_progress(&pool, &incoming).await.unwrap(), MergeOutcome::Applied);
+
+    // Payload must reflect the newer replica's values.
+    let (status, notes, version, updated): (String, Option<String>, i32, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "SELECT status::text, notes, version, updated_at
+             FROM job_step_progress WHERE work_order_id = $1 AND step_id = $2",
+        )
+        .bind(wo).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "Paused");
+    assert_eq!(notes.as_deref(), Some("shared note"));
+    assert_eq!(version, 3, "version must advance past the prior local row");
+    assert_eq!(updated, newer_ts);
+
+    // No conflict row was written — the resolution was deterministic.
+    let flagged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_log
+         WHERE entity_id = $1 AND conflict_flagged = TRUE",
+    ).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(flagged, 0);
+}
+
+#[actix_web::test]
+async fn merge_dual_notes_edit_forces_supervisor_review_regardless_of_timestamp() {
+    // PRD merge-review rule (re-audit High #2): when both sides have non-empty
+    // notes that disagree at the same version, the merge MUST flag for SUPER
+    // review — timestamp precedence alone is not trustworthy enough to silently
+    // overwrite a technician's narrative.
+    use fieldops_backend::enums::StepProgressStatus;
+    use fieldops_backend::sync::merge::{merge_step_progress, IncomingProgress, MergeOutcome};
+
+    let pool = fresh().await;
+    let branch: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO branches (name, lat, lng) VALUES ('B', 37.0, -122.0) RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let tech: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, role, branch_id)
+         VALUES ('tech', 'x', 'TECH', $1) RETURNING id",
+    ).bind(branch).fetch_one(&pool).await.unwrap();
+    let recipe: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipes (name) VALUES ('R') RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipe_steps (recipe_id, step_order, title) VALUES ($1, 1, 'S') RETURNING id",
+    ).bind(recipe).fetch_one(&pool).await.unwrap();
+    let wo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_orders (title, priority, state, assigned_tech_id, branch_id, recipe_id, version_count)
+         VALUES ('WO','NORMAL','InProgress',$1,$2,$3,1) RETURNING id",
+    ).bind(tech).bind(branch).bind(recipe).fetch_one(&pool).await.unwrap();
+
+    // Local has notes + explicit older timestamp.
+    let local_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1,$2,'InProgress','local tech wrote this',3,$3)",
+    ).bind(wo).bind(step).bind(local_ts).execute(&pool).await.unwrap();
+
+    // Incoming has DIFFERENT notes and a strictly LATER timestamp — under
+    // plain timestamp-priority the incoming would win. The dual-notes rule
+    // must override that and flag for SUPER review instead.
+    let newer_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T13:00:00Z".parse().unwrap();
+    let incoming = IncomingProgress {
+        work_order_id: wo, step_id: step,
+        status: StepProgressStatus::InProgress,
+        notes: Some("replica tech wrote something else".into()),
+        timer_state_snapshot: None,
+        version: 3,
+        updated_at: newer_ts,
+    };
+    assert_eq!(
+        merge_step_progress(&pool, &incoming).await.unwrap(),
+        MergeOutcome::Conflict,
+        "dual note edits must escalate regardless of timestamp"
+    );
+
+    // Local row is preserved — no silent overwrite of the technician's note.
+    let (notes, updated): (Option<String>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT notes, updated_at FROM job_step_progress
+         WHERE work_order_id = $1 AND step_id = $2",
+    ).bind(wo).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(notes.as_deref(), Some("local tech wrote this"));
+    assert_eq!(updated, local_ts);
+
+    // sync_log has one flagged, unresolved row awaiting SUPER.
+    let flagged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_log
+         WHERE entity_id = $1 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
+    ).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(flagged, 1);
+}
+
+#[actix_web::test]
+async fn merge_single_side_notes_still_applies_by_timestamp() {
+    // Sanity check: the dual-notes rule must NOT regress the normal case
+    // where only ONE side edited notes (classic add-vs-empty). A newer
+    // incoming timestamp should still win deterministically there.
+    use fieldops_backend::enums::StepProgressStatus;
+    use fieldops_backend::sync::merge::{merge_step_progress, IncomingProgress, MergeOutcome};
+
+    let pool = fresh().await;
+    let branch: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO branches (name, lat, lng) VALUES ('B', 37.0, -122.0) RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let tech: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, role, branch_id)
+         VALUES ('tech', 'x', 'TECH', $1) RETURNING id",
+    ).bind(branch).fetch_one(&pool).await.unwrap();
+    let recipe: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipes (name) VALUES ('R') RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipe_steps (recipe_id, step_order, title) VALUES ($1, 1, 'S') RETURNING id",
+    ).bind(recipe).fetch_one(&pool).await.unwrap();
+    let wo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_orders (title, priority, state, assigned_tech_id, branch_id, recipe_id, version_count)
+         VALUES ('WO','NORMAL','InProgress',$1,$2,$3,1) RETURNING id",
+    ).bind(tech).bind(branch).bind(recipe).fetch_one(&pool).await.unwrap();
+
+    // Local has NO notes — only one side will have edited notes.
+    let local_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1,$2,'InProgress',NULL,3,$3)",
+    ).bind(wo).bind(step).bind(local_ts).execute(&pool).await.unwrap();
+
+    let newer_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T13:00:00Z".parse().unwrap();
+    let incoming = IncomingProgress {
+        work_order_id: wo, step_id: step,
+        status: StepProgressStatus::Paused,
+        notes: Some("first note from replica".into()),
+        timer_state_snapshot: None,
+        version: 3,
+        updated_at: newer_ts,
+    };
+    assert_eq!(
+        merge_step_progress(&pool, &incoming).await.unwrap(),
+        MergeOutcome::Applied
+    );
+    let flagged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_log
+         WHERE entity_id = $1 AND conflict_flagged = TRUE",
+    ).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(flagged, 0, "one-sided note edit must not escalate");
+}
+
+#[actix_web::test]
+async fn merge_equal_version_older_timestamp_rejected_deterministically() {
+    // PRD §8 timestamp-priority rule: equal version + older incoming timestamp
+    // loses deterministically — no conflict row, no overwrite of local state.
+    use fieldops_backend::enums::StepProgressStatus;
+    use fieldops_backend::sync::merge::{merge_step_progress, IncomingProgress, MergeOutcome};
+
+    let pool = fresh().await;
+    let branch: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO branches (name, lat, lng) VALUES ('B', 37.0, -122.0) RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let tech: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, role, branch_id)
+         VALUES ('tech', 'x', 'TECH', $1) RETURNING id",
+    ).bind(branch).fetch_one(&pool).await.unwrap();
+    let recipe: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipes (name) VALUES ('R') RETURNING id",
+    ).fetch_one(&pool).await.unwrap();
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO recipe_steps (recipe_id, step_order, title) VALUES ($1, 1, 'S') RETURNING id",
+    ).bind(recipe).fetch_one(&pool).await.unwrap();
+    let wo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO work_orders (title, priority, state, assigned_tech_id, branch_id, recipe_id, version_count)
+         VALUES ('WO','NORMAL','InProgress',$1,$2,$3,1) RETURNING id",
+    ).bind(tech).bind(branch).bind(recipe).fetch_one(&pool).await.unwrap();
+
+    // Same notes on both sides so we exercise the timestamp-priority branch
+    // without tripping the dual-notes invariant.
+    let local_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:30:00Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO job_step_progress (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1,$2,'Paused','shared note',2,$3)",
+    ).bind(wo).bind(step).bind(local_ts).execute(&pool).await.unwrap();
+
+    let older_ts: chrono::DateTime<chrono::Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
+    let incoming = IncomingProgress {
+        work_order_id: wo, step_id: step,
+        status: StepProgressStatus::InProgress,
+        notes: Some("shared note".into()),
+        timer_state_snapshot: None,
+        version: 2,
+        updated_at: older_ts,
+    };
+    assert_eq!(
+        merge_step_progress(&pool, &incoming).await.unwrap(),
+        MergeOutcome::RejectedOlder
+    );
+
+    // Local row is untouched.
+    let (status, notes, updated): (String, Option<String>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "SELECT status::text, notes, updated_at
+             FROM job_step_progress WHERE work_order_id = $1 AND step_id = $2",
+        )
+        .bind(wo).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "Paused");
+    assert_eq!(notes.as_deref(), Some("shared note"));
+    assert_eq!(updated, local_ts);
+
+    let flagged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_log
+         WHERE entity_id = $1 AND conflict_flagged = TRUE",
+    ).bind(step).fetch_one(&pool).await.unwrap();
+    assert_eq!(flagged, 0, "rejected-older must not create a conflict row");
 }
 
 #[actix_web::test]

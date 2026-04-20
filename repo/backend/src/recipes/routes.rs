@@ -14,6 +14,7 @@ use crate::enums::TimerAlertType;
 use crate::errors::ApiError;
 use crate::middleware::rbac::{require_role, AuthedUser};
 use crate::pagination::{PageParams, Paginated};
+use crate::processing_log;
 use crate::log_info;
 
 const MODULE: &str = "recipes";
@@ -170,6 +171,7 @@ pub async fn create_tip_card(
     if req.title.trim().is_empty() || req.content.trim().is_empty() {
         return Err(ApiError::BadRequest("title and content required".into()));
     }
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, TipCard>(
         "INSERT INTO tip_cards (step_id, title, content, authored_by, is_pinned)
          VALUES ($1, $2, $3, $4, COALESCE($5, TRUE))
@@ -180,8 +182,22 @@ pub async fn create_tip_card(
     .bind(&req.content)
     .bind(user.user_id())
     .bind(req.is_pinned)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::TIP_CARD_CREATE,
+        "tip_cards",
+        Some(row.id),
+        json!({
+            "step_id": row.step_id,
+            "title": row.title,
+            "is_pinned": row.is_pinned,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "tip_cards_create", "user={} step={} card={}", user.user_id(), req.step_id, row.id);
     Ok(HttpResponse::Created().json(row))
 }
@@ -196,6 +212,7 @@ pub async fn update_tip_card(
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
     let req = body.into_inner();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, TipCard>(
         "UPDATE tip_cards
          SET title     = COALESCE($1, title),
@@ -209,9 +226,23 @@ pub async fn update_tip_card(
     .bind(&req.content)
     .bind(req.is_pinned)
     .bind(id)
-    .fetch_optional(pool.get_ref())
+    .fetch_optional(&mut *tx)
     .await?;
     let row = row.ok_or_else(|| ApiError::NotFound("tip card not found".into()))?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::TIP_CARD_UPDATE,
+        "tip_cards",
+        Some(row.id),
+        json!({
+            "title_changed": req.title.is_some(),
+            "content_changed": req.content.is_some(),
+            "pinned_changed": req.is_pinned.is_some(),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "tip_cards_update", "user={} card={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(row))
 }

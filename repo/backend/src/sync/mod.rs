@@ -308,3 +308,22 @@ pub async fn log_soft_delete(
     .await?;
     Ok(())
 }
+
+/// Transactional variant — participates in the caller's transaction so the
+/// soft-delete row and the DELETE tombstone land atomically with the audit
+/// log and any other state-changing writes in the same request.
+pub async fn log_soft_delete_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entity_table: &str,
+    entity_id: Uuid,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO sync_log (entity_table, entity_id, operation, old_etag, new_etag)
+         VALUES ($1, $2, 'DELETE', NULL, NULL)",
+    )
+    .bind(entity_table)
+    .bind(entity_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}

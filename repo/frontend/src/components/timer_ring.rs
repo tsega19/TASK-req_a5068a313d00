@@ -183,6 +183,39 @@ fn format_mmss(seconds: u32) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    // Configure is centralized in types.rs; see the note there.
+
+    #[wasm_bindgen_test]
+    fn format_mmss_pads_minutes_and_seconds() {
+        assert_eq!(format_mmss(0), "00:00");
+        assert_eq!(format_mmss(9), "00:09");
+        assert_eq!(format_mmss(59), "00:59");
+        assert_eq!(format_mmss(60), "01:00");
+        assert_eq!(format_mmss(3_599), "59:59");
+        // Long bakes that exceed an hour still display with two-digit minutes
+        // — the UI renders them as "60:00", not "1:00:00". That's deliberate;
+        // technicians compare ring-to-ring, and re-padding to H:MM:SS would
+        // change the visual width mid-bake.
+        assert_eq!(format_mmss(3_600), "60:00");
+    }
+
+    #[wasm_bindgen_test]
+    fn timer_snapshot_roundtrips_through_serde() {
+        let id = uuid::Uuid::new_v4();
+        let s = TimerSnapshot { timer_id: id, remaining_seconds: 45, running: true };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: TimerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.timer_id, id);
+        assert_eq!(back.remaining_seconds, 45);
+        assert!(back.running);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Audible stub: a single 880Hz beep via Web Audio — no external audio service.
 // Wrapped in a thread-local so we reuse one AudioContext.

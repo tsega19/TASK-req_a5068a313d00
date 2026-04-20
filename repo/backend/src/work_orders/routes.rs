@@ -15,8 +15,10 @@ use crate::enums::WorkOrderState;
 use crate::errors::ApiError;
 use crate::etag;
 use crate::geo::haversine_miles;
+use crate::location::geocode_stub;
 use crate::middleware::rbac::{require_any_role, AuthedUser};
 use crate::pagination::{PageParams, Paginated};
+use crate::processing_log;
 use crate::state_machine::{allowed_transition, TransitionContext};
 use crate::work_orders::models::{
     CreateWorkOrder, StateTransitionRequest, WorkOrder, WorkOrderTransition,
@@ -116,6 +118,14 @@ pub async fn on_call_queue(
 ) -> Result<HttpResponse, ApiError> {
     require_any_role(&user, &[Role::Super, Role::Admin])?;
     let hours = cfg.business.on_call_high_priority_hours;
+    // PRD supervisor-scope rule: SUPER sees only their own branch; ADMIN is
+    // global. The `$2::uuid IS NULL` arm covers the ADMIN case without a
+    // second query path.
+    let scope_branch: Option<Uuid> = match user.role() {
+        Role::Super => user.branch_id(),
+        Role::Admin => None,
+        Role::Tech => unreachable!("require_any_role above rejects TECH"),
+    };
     let rows = sqlx::query_as::<_, WorkOrder>(
         "SELECT * FROM work_orders
          WHERE deleted_at IS NULL
@@ -123,12 +133,14 @@ pub async fn on_call_queue(
            AND state NOT IN ('Completed', 'Canceled')
            AND sla_deadline IS NOT NULL
            AND NOW() > sla_deadline - make_interval(hours => $1)
+           AND ($2::uuid IS NULL OR branch_id = $2)
          ORDER BY sla_deadline ASC",
     )
     .bind(hours as i32)
+    .bind(scope_branch)
     .fetch_all(pool.get_ref())
     .await?;
-    log_info!(MODULE, "on_call_queue", "user={} count={}", user.user_id(), rows.len());
+    log_info!(MODULE, "on_call_queue", "user={} role={} count={}", user.user_id(), user.role(), rows.len());
     Ok(HttpResponse::Ok().json(json!({ "data": rows, "total": rows.len() })))
 }
 
@@ -158,9 +170,43 @@ pub async fn create_work_order(
     body: web::Json<CreateWorkOrder>,
 ) -> Result<HttpResponse, ApiError> {
     require_any_role(&user, &[Role::Super, Role::Admin])?;
-    let req = body.into_inner();
+    let mut req = body.into_inner();
     if req.title.trim().is_empty() {
         return Err(ApiError::BadRequest("title required".into()));
+    }
+
+    // Offline ZIP+4 normalization (PRD §6). When the caller supplies a
+    // free-form address, run it through the bundled geocoder and persist the
+    // canonical form + coordinates. Explicit lat/lng in the request override
+    // the geocoded coords so an operator can pin a precise location.
+    if let Some(ref raw) = req.location_address_norm.clone() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let g = geocode_stub::geocode(trimmed);
+            // Strict mode: reject unknown addresses instead of silently
+            // storing synthetic hash-derived coordinates, which would skew
+            // branch-radius checks and location-trail analytics.
+            if !g.from_index && !cfg.app.allow_geocode_fallback {
+                return Err(ApiError::BadRequest(format!(
+                    "address '{}' not found in bundled ZIP+4 index — supply a canonical ZIP+4 or explicit lat/lng",
+                    trimmed
+                )));
+            }
+            req.location_address_norm = Some(g.address_norm);
+            if req.location_lat.is_none() {
+                req.location_lat = Some(g.lat);
+            }
+            if req.location_lng.is_none() {
+                req.location_lng = Some(g.lng);
+            }
+            log_info!(
+                MODULE,
+                "geocode",
+                "input='{}' from_index={}",
+                trimmed,
+                g.from_index
+            );
+        }
     }
 
     // Radius validation (PRD §7) when both coordinates and a branch are given.
@@ -196,6 +242,7 @@ pub async fn create_work_order(
         now.timestamp().to_string(),
     ]);
 
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO work_orders (id, title, description, priority, state,
             assigned_tech_id, branch_id, sla_deadline, recipe_id,
@@ -216,18 +263,35 @@ pub async fn create_work_order(
     .bind(req.location_lng)
     .bind(&etag_v)
     .bind(now)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
 
-    // Record the initial (null → Scheduled) transition for timeline completeness.
+    // Record the initial (null -> Scheduled) transition for timeline completeness.
     sqlx::query(
         "INSERT INTO work_order_transitions (work_order_id, from_state, to_state, triggered_by, required_fields, notes)
          VALUES ($1, NULL, 'Scheduled', $2, '{}'::jsonb, 'initial')",
     )
     .bind(id)
     .bind(user.user_id())
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
+
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::WO_CREATE,
+        "work_orders",
+        Some(id),
+        json!({
+            "title": req.title,
+            "priority": format!("{:?}", priority),
+            "assigned_tech_id": req.assigned_tech_id,
+            "branch_id": req.branch_id,
+            "location_address_norm": req.location_address_norm,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
 
     // Silence the unused-config warning in the unlikely path where radius check
     // was skipped; cfg is re-used by background ticker via state machine logic.
@@ -249,6 +313,7 @@ pub async fn create_work_order(
 pub async fn transition_state(
     user: AuthedUser,
     pool: web::Data<PgPool>,
+    cfg: web::Data<AppConfig>,
     path: web::Path<Uuid>,
     body: web::Json<StateTransitionRequest>,
 ) -> Result<HttpResponse, ApiError> {
@@ -390,6 +455,22 @@ pub async fn transition_state(
     .bind(&req.notes)
     .execute(&mut *tx)
     .await?;
+
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::WO_TRANSITION,
+        "work_orders",
+        Some(id),
+        json!({
+            "from": format!("{:?}", wo.state),
+            "to": format!("{:?}", req.to_state),
+            "lat": req.lat,
+            "lng": req.lng,
+            "notes_present": req.notes.is_some(),
+        }),
+    )
+    .await?;
     tx.commit().await?;
 
     log_info!(
@@ -401,6 +482,32 @@ pub async fn transition_state(
         wo.state,
         req.to_state
     );
+
+    // Fan out a templated CANCELLATION notification to the assigned technician
+    // when a work order is canceled — satisfies PRD §7 event coverage. Runs
+    // best-effort after the transition has already committed, so a transient
+    // notification error never rolls back the state change.
+    if matches!(req.to_state, WorkOrderState::Canceled) {
+        if let Some(tech_id) = wo.assigned_tech_id {
+            let payload = serde_json::json!({
+                "work_order_id": id,
+                "title": wo.title,
+                "canceled_by": user.user_id(),
+                "notes": req.notes,
+            });
+            if let Err(e) = crate::notifications::stub::send(
+                pool.get_ref(),
+                cfg.get_ref(),
+                tech_id,
+                crate::enums::NotificationTemplate::Cancellation,
+                payload,
+            )
+            .await
+            {
+                log_warn!(MODULE, "cancellation_notify_failed", "wo={} err={}", id, e);
+            }
+        }
+    }
 
     let wo_new = sqlx::query_as::<_, WorkOrder>("SELECT * FROM work_orders WHERE id = $1")
         .bind(id)
@@ -443,19 +550,31 @@ pub async fn delete_work_order(
 ) -> Result<HttpResponse, ApiError> {
     require_any_role(&user, &[Role::Admin])?;
     let id = path.into_inner();
+    // Run soft-delete + tombstone + audit write in a single transaction so
+    // either all three land or none do — strict audit guarantee (PRD §7).
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE work_orders SET deleted_at = NOW(), updated_at = NOW()
          WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound("work order not found".into()));
     }
-    // Propagate to offline replicas via sync_log (deterministic tombstone).
-    crate::sync::log_soft_delete(pool.get_ref(), "work_orders", id).await?;
+    crate::sync::log_soft_delete_tx(&mut tx, "work_orders", id).await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::WO_DELETE,
+        "work_orders",
+        Some(id),
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
     log_warn!(MODULE, "delete", "user={} wo={} soft-deleted", user.user_id(), id);
     Ok(HttpResponse::NoContent().finish())
 }

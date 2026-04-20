@@ -13,6 +13,8 @@ use crate::config::AppConfig;
 use crate::errors::ApiError;
 use crate::middleware::rbac::{require_role, AuthedUser};
 use crate::pagination::{PageParams, Paginated};
+use crate::processing_log;
+use crate::processing_log::ProcessingLogRow;
 use crate::sync;
 use crate::log_info;
 
@@ -76,10 +78,16 @@ pub async fn create_user(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let req = body.into_inner();
-    if req.username.trim().is_empty() || req.password.len() < 4 {
-        return Err(ApiError::BadRequest("username + password (≥4 chars) required".into()));
+    if req.username.trim().is_empty() {
+        return Err(ApiError::BadRequest("username required".into()));
+    }
+    if req.password.len() < 12 {
+        return Err(ApiError::BadRequest(
+            "password must be at least 12 characters".into(),
+        ));
     }
     let hash = hash_password(&req.password, &cfg.auth)?;
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
         "INSERT INTO users (username, password_hash, role, branch_id, full_name)
          VALUES ($1, $2, $3, $4, $5)
@@ -91,15 +99,47 @@ pub async fn create_user(
     .bind(req.role)
     .bind(req.branch_id)
     .bind(&req.full_name)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("users_username_key") {
             ApiError::Conflict("username already exists".into())
         } else {
-            e.into()
+            ApiError::from(e)
         }
     })?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::USER_CREATE,
+        "users",
+        Some(row.id),
+        serde_json::json!({
+            "username": row.username,
+            "role": row.role,
+            "branch_id": row.branch_id,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    // Post-commit, best-effort: welcome the newly-created user with a templated
+    // SIGNUP_SUCCESS notification (PRD §7 templated events). A failure here
+    // never rolls back the user create — the row is already authoritative.
+    if let Err(e) = crate::notifications::stub::send(
+        pool.get_ref(),
+        cfg.get_ref(),
+        row.id,
+        crate::enums::NotificationTemplate::SignupSuccess,
+        serde_json::json!({
+            "username": row.username,
+            "role": row.role,
+            "created_by": user.user_id(),
+        }),
+    )
+    .await
+    {
+        log_info!(MODULE, "signup_notify_failed", "user={} err={}", row.id, e);
+    }
     log_info!(MODULE, "users_create", "actor={} new_user={} role={}", user.user_id(), row.id, row.role);
     Ok(HttpResponse::Created().json(row))
 }
@@ -116,9 +156,18 @@ pub async fn update_user(
     let id = path.into_inner();
     let req = body.into_inner();
     let new_hash = match &req.password {
-        Some(p) if !p.is_empty() => Some(hash_password(p, &cfg.auth)?),
+        Some(p) if !p.is_empty() => {
+            if p.len() < 12 {
+                return Err(ApiError::BadRequest(
+                    "password must be at least 12 characters".into(),
+                ));
+            }
+            Some(hash_password(p, &cfg.auth)?)
+        }
         _ => None,
     };
+    let password_changed = new_hash.is_some();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
         "UPDATE users SET
             password_hash = COALESCE($1, password_hash),
@@ -137,9 +186,25 @@ pub async fn update_user(
     .bind(&req.full_name)
     .bind(req.privacy_mode)
     .bind(id)
-    .fetch_optional(pool.get_ref())
+    .fetch_optional(&mut *tx)
     .await?;
     let row = row.ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::USER_UPDATE,
+        "users",
+        Some(row.id),
+        serde_json::json!({
+            "role_changed": req.role.is_some(),
+            "branch_changed": req.branch_id.is_some(),
+            "full_name_changed": req.full_name.is_some(),
+            "privacy_mode_changed": req.privacy_mode.is_some(),
+            "password_changed": password_changed,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "users_update", "actor={} target={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(row))
 }
@@ -155,17 +220,28 @@ pub async fn delete_user(
     if id == user.user_id() {
         return Err(ApiError::BadRequest("admins cannot delete themselves".into()));
     }
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE users SET deleted_at = NOW(), updated_at = NOW()
          WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound("user not found".into()));
     }
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::USER_DELETE,
+        "users",
+        Some(id),
+        serde_json::json!({ "soft_delete": true }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "users_delete", "actor={} target={} soft-deleted", user.user_id(), id);
     Ok(HttpResponse::NoContent().finish())
 }
@@ -240,6 +316,7 @@ pub async fn create_branch(
     let radius = req
         .service_radius_miles
         .unwrap_or(cfg.business.default_service_radius_miles);
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, Branch>(
         "INSERT INTO branches (name, address, lat, lng, service_radius_miles)
          VALUES ($1, $2, $3, $4, $5)
@@ -250,8 +327,18 @@ pub async fn create_branch(
     .bind(req.lat)
     .bind(req.lng)
     .bind(radius)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::BRANCH_CREATE,
+        "branches",
+        Some(row.id),
+        serde_json::json!({ "name": row.name }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "branches_create", "actor={} branch={}", user.user_id(), row.id);
     Ok(HttpResponse::Created().json(row))
 }
@@ -266,6 +353,7 @@ pub async fn update_branch(
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
     let req = body.into_inner();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, Branch>(
         "UPDATE branches SET
             name                 = COALESCE($1, name),
@@ -282,9 +370,24 @@ pub async fn update_branch(
     .bind(req.lng)
     .bind(req.service_radius_miles)
     .bind(id)
-    .fetch_optional(pool.get_ref())
+    .fetch_optional(&mut *tx)
     .await?;
     let row = row.ok_or_else(|| ApiError::NotFound("branch not found".into()))?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::BRANCH_UPDATE,
+        "branches",
+        Some(row.id),
+        serde_json::json!({
+            "name_changed": req.name.is_some(),
+            "address_changed": req.address.is_some(),
+            "coords_changed": req.lat.is_some() || req.lng.is_some(),
+            "radius_changed": req.service_radius_miles.is_some(),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "branches_update", "actor={} branch={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(row))
 }
@@ -345,7 +448,61 @@ pub async fn trigger_notifications_retry(
         "delivered": report.delivered,
         "giveup": report.giveup,
         "skipped_backoff": report.skipped_backoff,
+        "failed_again": report.failed_again,
+        "rate_limited_waiting": report.rate_limited_waiting,
     })))
+}
+
+// -----------------------------------------------------------------------------
+// Processing log (immutable audit trail, PRD §7) — admin read-only.
+// -----------------------------------------------------------------------------
+#[get("/processing-log")]
+pub async fn list_processing_log(
+    user: AuthedUser,
+    pool: web::Data<PgPool>,
+    q: web::Query<PageParams>,
+) -> Result<HttpResponse, ApiError> {
+    require_role(&user, Role::Admin)?;
+    let params = q.into_inner();
+    let (offset, limit) = params.offset_limit();
+    let rows = sqlx::query_as::<_, ProcessingLogRow>(
+        "SELECT id, user_id, action, entity_table, entity_id, payload, created_at
+         FROM processing_log
+         ORDER BY created_at DESC
+         OFFSET $1 LIMIT $2",
+    )
+    .bind(offset)
+    .bind(limit)
+    .fetch_all(pool.get_ref())
+    .await?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processing_log")
+        .fetch_one(pool.get_ref())
+        .await?;
+    log_info!(MODULE, "plog_list", "actor={} count={}", user.user_id(), rows.len());
+    Ok(HttpResponse::Ok().json(Paginated::new(rows, params, total)))
+}
+
+// -----------------------------------------------------------------------------
+// SLA alert trigger — admin ad-hoc runner for the periodic worker.
+// -----------------------------------------------------------------------------
+#[post("/sla/scan")]
+pub async fn trigger_sla_scan(
+    user: AuthedUser,
+    pool: web::Data<PgPool>,
+    cfg: web::Data<AppConfig>,
+) -> Result<HttpResponse, ApiError> {
+    require_role(&user, Role::Admin)?;
+    let report = crate::sla::scan_and_alert(pool.get_ref(), cfg.get_ref()).await?;
+    log_info!(
+        MODULE,
+        "sla_scan",
+        "actor={} scanned={} alerts={} deduped={}",
+        user.user_id(),
+        report.scanned,
+        report.alerts_emitted,
+        report.deduped
+    );
+    Ok(HttpResponse::Ok().json(report.to_json()))
 }
 
 // -----------------------------------------------------------------------------
@@ -363,4 +520,6 @@ pub fn scope() -> actix_web::Scope {
         .service(trigger_sync)
         .service(trigger_retention)
         .service(trigger_notifications_retry)
+        .service(list_processing_log)
+        .service(trigger_sla_scan)
 }

@@ -128,6 +128,23 @@ fn shell() -> Html {
         );
     }
 
+    // Offline-first sync loop: once the user is authenticated, start a
+    // background Interval that pulls `/api/sync/changes` and replays any
+    // queued mutations. The Interval is kept alive via `use_state` —
+    // dropping it on logout stops the loop automatically.
+    {
+        let authed = auth.state.is_authed();
+        let state = auth.state.clone();
+        use_effect_with(authed, move |authed| {
+            let handle: Option<gloo_timers::callback::Interval> = if *authed {
+                Some(crate::offline::start_sync_loop(state))
+            } else {
+                None
+            };
+            move || drop(handle)
+        });
+    }
+
     html! {
         <div class="app-shell">
             if auth.state.is_authed() { <TopBar /> }

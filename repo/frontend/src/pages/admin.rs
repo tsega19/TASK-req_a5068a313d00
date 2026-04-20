@@ -7,6 +7,23 @@ use crate::app::{toast_err, toast_ok, AuthCtx, RoleGate, ToastCtx};
 use crate::components::loading_button::LoadingButton;
 use crate::types::{Branch, Paginated, Role};
 
+/// Minimum password length for admin-created users. Mirrors the backend rule
+/// in `backend/src/admin/routes.rs`. Keep the two in lockstep.
+const MIN_PASSWORD_LEN: usize = 12;
+
+/// Returns Ok when the create-user form can be submitted; Err with a user-
+/// facing reason otherwise. Separating this from the event handler lets the
+/// #[cfg(test)] module below pin the contract without spinning up a DOM.
+pub(crate) fn validate_create_user(username: &str, password: &str) -> Result<(), &'static str> {
+    if username.trim().is_empty() {
+        return Err("Username is required");
+    }
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err("Username + password (\u{2265}12 chars) required");
+    }
+    Ok(())
+}
+
 #[function_component(AdminPanel)]
 pub fn admin_panel() -> Html {
     html! {
@@ -82,8 +99,10 @@ fn users_section() -> Html {
             if *creating {
                 return;
             }
-            if username.is_empty() || password.len() < 4 {
-                toast_err(&toasts, "Username + password (≥4 chars) required");
+            // Mirrors backend rule in backend/src/admin/routes.rs — a weaker
+            // client rule just produces predictable 400s and operator confusion.
+            if let Err(msg) = validate_create_user(&username, &password) {
+                toast_err(&toasts, msg);
                 return;
             }
             creating.set(true);
@@ -458,4 +477,37 @@ fn select_input(state: UseStateHandle<String>) -> Callback<Event> {
             state.set(el.value());
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    // Configure is centralized in types.rs; see the note there.
+
+    #[wasm_bindgen_test]
+    fn create_user_rejects_empty_username() {
+        let err = validate_create_user("", "a-long-enough-password").unwrap_err();
+        assert!(err.contains("Username"), "got: {}", err);
+        // Whitespace-only username is also empty.
+        assert!(validate_create_user("   ", "a-long-enough-password").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn create_user_rejects_short_password_matching_backend_rule() {
+        // Backend (backend/src/admin/routes.rs) rejects <12. The frontend
+        // must agree so the operator never ships a doomed request.
+        assert!(validate_create_user("alice", "short").is_err());
+        // 11-char password — one below the floor.
+        assert!(validate_create_user("alice", "elevenchars").is_err());
+        // Exactly MIN_PASSWORD_LEN (12) is accepted.
+        assert_eq!("twelvecharsx".len(), MIN_PASSWORD_LEN);
+        assert!(validate_create_user("alice", "twelvecharsx").is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    fn create_user_accepts_happy_path() {
+        assert!(validate_create_user("alice", "plenty-long-password").is_ok());
+    }
 }

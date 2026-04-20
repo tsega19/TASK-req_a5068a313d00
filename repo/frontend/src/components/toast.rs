@@ -13,7 +13,9 @@ pub enum ToastKind {
 }
 
 impl ToastKind {
-    fn css(&self) -> &'static str {
+    // `pub(crate)` so the #[cfg(test)] module below can exercise the mapping
+    // without rendering. The stylesheet uses these exact classes.
+    pub(crate) fn css(&self) -> &'static str {
         match self {
             ToastKind::Ok => "toast ok",
             ToastKind::Err => "toast err",
@@ -73,5 +75,31 @@ fn toast_item(props: &ToastItemProps) -> Html {
         <div class={props.toast.kind.css()} onclick={dismiss}>
             { &props.toast.message }
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    // Configure is centralized in types.rs; see the note there.
+
+    #[wasm_bindgen_test]
+    fn toast_kind_css_is_stable() {
+        // The stylesheet relies on these exact kind-to-class mappings. A
+        // rename here without a matching CSS update silently hides toasts.
+        assert_eq!(ToastKind::Ok.css(),   "toast ok");
+        assert_eq!(ToastKind::Err.css(),  "toast err");
+        assert_eq!(ToastKind::Warn.css(), "toast warn");
+    }
+
+    #[wasm_bindgen_test]
+    fn toast_new_preserves_kind_and_message() {
+        let t = Toast::new(ToastKind::Err, "failed to save".to_string());
+        assert_eq!(t.kind, ToastKind::Err);
+        assert_eq!(t.message, "failed to save");
+        // id is assigned by the reducer, `new` stubs 0.
+        assert_eq!(t.id, 0);
     }
 }

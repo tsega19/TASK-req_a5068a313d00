@@ -127,3 +127,60 @@ fn bounds(
     }
     (min_lat, max_lat, min_lng, max_lng)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use wasm_bindgen_test::*;
+
+    // Configure is centralized in types.rs; see the note there.
+
+    fn tp(lat: f64, lng: f64) -> TrailPoint {
+        TrailPoint {
+            id: uuid::Uuid::new_v4(),
+            work_order_id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            lat,
+            lng,
+            precision_reduced: false,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn bounds_defaults_to_continental_us_when_empty() {
+        let (min_lat, max_lat, min_lng, max_lng) = bounds(&[], None, None);
+        assert_eq!(min_lat, 25.0);
+        assert_eq!(max_lat, 49.0);
+        assert_eq!(min_lng, -125.0);
+        assert_eq!(max_lng, -67.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn bounds_fits_trail_points() {
+        let (min_lat, max_lat, min_lng, max_lng) =
+            bounds(&[tp(37.0, -122.0), tp(40.0, -120.0)], None, None);
+        assert!(min_lat <= 37.0);
+        assert!(max_lat >= 40.0);
+        assert!(min_lng <= -122.0);
+        assert!(max_lng >= -120.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn bounds_include_pin_coords_when_supplied() {
+        let (min_lat, max_lat, _, _) = bounds(&[tp(37.0, -122.0)], Some(45.0), Some(-120.0));
+        assert!(max_lat >= 45.0, "pin lat must expand bounds upward");
+        assert!(min_lat <= 37.0, "trail lat must remain inside bounds");
+    }
+
+    #[wasm_bindgen_test]
+    fn bounds_expands_degenerate_ranges() {
+        // Two points on the same lat/lng — the raw span is zero and would
+        // produce a divide-by-zero in the projection. The helper must pad.
+        let (min_lat, max_lat, min_lng, max_lng) =
+            bounds(&[tp(37.0, -122.0), tp(37.0, -122.0)], None, None);
+        // With no points-with-variance the function falls back to continental US.
+        assert_eq!((min_lat, max_lat, min_lng, max_lng), (25.0, 49.0, -125.0, -67.0));
+    }
+}

@@ -17,7 +17,9 @@ use crate::auth::models::Role;
 use crate::enums::CheckInType;
 use crate::errors::ApiError;
 use crate::geo::{haversine_miles, reduce_precision};
-use crate::middleware::rbac::AuthedUser;
+use crate::location::geocode_stub;
+use crate::middleware::rbac::{require_any_role, AuthedUser};
+use crate::processing_log;
 use crate::work_orders::routes::load_visible;
 use crate::{log_info, log_warn};
 
@@ -70,8 +72,12 @@ pub async fn post_trail_point(
 ) -> Result<HttpResponse, ApiError> {
     let wo_id = path.into_inner();
     let wo = load_visible(&pool, &user, wo_id).await?;
-    if matches!(user.role(), Role::Tech) && wo.assigned_tech_id != Some(user.user_id()) {
-        return Err(ApiError::Forbidden("not assigned to this work order".into()));
+    // Trail integrity (PRD §9): only the assigned TECH records their own
+    // trajectory. SUPER/ADMIN can read but MUST NOT inject points.
+    if !matches!(user.role(), Role::Tech) || wo.assigned_tech_id != Some(user.user_id()) {
+        return Err(ApiError::Forbidden(
+            "only the assigned technician may record trail points".into(),
+        ));
     }
 
     // Fetch owner's privacy flag.
@@ -89,6 +95,7 @@ pub async fn post_trail_point(
         (body.lat, body.lng, false)
     };
 
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, TrailRow>(
         "INSERT INTO location_trails
             (work_order_id, user_id, lat, lng, precision_reduced, recorded_at)
@@ -100,9 +107,22 @@ pub async fn post_trail_point(
     .bind(lat)
     .bind(lng)
     .bind(reduced)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
 
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::TRAIL_POINT,
+        "location_trails",
+        Some(row.id),
+        json!({
+            "work_order_id": wo_id,
+            "precision_reduced": reduced,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "trail_post", "user={} wo={} reduced={}", user.user_id(), wo_id, reduced);
     Ok(HttpResponse::Created().json(row))
 }
@@ -129,7 +149,9 @@ pub async fn get_trail(
 
     let (show_full, hidden): (bool, bool) = match user.role() {
         Role::Admin => (true, false),
-        Role::Tech if wo.assigned_tech_id == Some(user.user_id()) => (!owner_privacy, false),
+        // Owner TECH always sees their own trail at full precision, regardless
+        // of privacy_mode — privacy hides from OTHERS, not from the owner.
+        Role::Tech if wo.assigned_tech_id == Some(user.user_id()) => (true, false),
         Role::Super => {
             if owner_privacy {
                 (false, true) // HIDDEN from SUPER when privacy mode is on
@@ -207,6 +229,7 @@ pub async fn post_check_in(
         }
     }
 
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, CheckInRow>(
         "INSERT INTO check_ins (work_order_id, user_id, type, lat, lng, recorded_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
@@ -217,9 +240,22 @@ pub async fn post_check_in(
     .bind(body.kind)
     .bind(body.lat)
     .bind(body.lng)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
 
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::CHECK_IN,
+        "check_ins",
+        Some(row.id),
+        json!({
+            "work_order_id": wo_id,
+            "type": format!("{:?}", body.kind),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "check_in",
@@ -229,4 +265,72 @@ pub async fn post_check_in(
         body.kind
     );
     Ok(HttpResponse::Created().json(row))
+}
+
+/// Dedicated offline-geocoding endpoint (PRD §6). Supervisors and admins can
+/// pre-resolve an address to its canonical ZIP+4 form and coordinates before
+/// creating a work order, so the UI shows the normalized value up front.
+#[derive(Debug, Deserialize)]
+pub struct GeocodeRequest {
+    pub query: Option<String>,
+    pub zip4: Option<String>,
+    pub street: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GeocodeResponse {
+    pub address_norm: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub from_index: bool,
+}
+
+#[post("/geocode")]
+pub async fn geocode(
+    user: AuthedUser,
+    cfg: web::Data<crate::config::AppConfig>,
+    body: web::Json<GeocodeRequest>,
+) -> Result<HttpResponse, ApiError> {
+    require_any_role(&user, &[Role::Super, Role::Admin])?;
+    let req = body.into_inner();
+    let result = if let Some(z) = req.zip4.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match geocode_stub::normalize(z, req.street.as_deref()) {
+            Some(g) => g,
+            None => {
+                return Err(ApiError::NotFound(format!(
+                    "zip4 '{}' not in bundled index",
+                    z
+                )))
+            }
+        }
+    } else if let Some(q) = req.query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let g = geocode_stub::geocode(q);
+        // Deny the synthetic-fallback result in strict mode so unknown
+        // addresses don't silently produce synthetic coordinates that then
+        // taint radius checks and trail analytics.
+        if !g.from_index && !cfg.app.allow_geocode_fallback {
+            return Err(ApiError::BadRequest(format!(
+                "address '{}' not found in bundled ZIP+4 index",
+                q
+            )));
+        }
+        g
+    } else {
+        return Err(ApiError::BadRequest(
+            "provide either zip4 (+optional street) or query".into(),
+        ));
+    };
+    log_info!(
+        MODULE,
+        "geocode",
+        "user={} from_index={}",
+        user.user_id(),
+        result.from_index
+    );
+    Ok(HttpResponse::Ok().json(GeocodeResponse {
+        address_norm: result.address_norm,
+        lat: result.lat,
+        lng: result.lng,
+        from_index: result.from_index,
+    }))
 }

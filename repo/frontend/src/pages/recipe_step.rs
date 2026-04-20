@@ -1,13 +1,14 @@
+use gloo_net::http::Method;
 use std::collections::HashMap;
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
-use crate::api;
 use crate::app::{toast_err, toast_ok, AuthCtx, ToastCtx};
 use crate::components::loading_button::LoadingButton;
 use crate::components::timer_ring::{TimerRing, TimerSnapshot};
+use crate::offline;
 use crate::types::{DataEnvelope, RecipeStep, StepProgress, StepProgressStatus, TipCard};
 
 #[derive(Properties, PartialEq)]
@@ -53,15 +54,17 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
         use_effect_with((wo_id, step_id), move |_| {
             let state = auth.state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                // Step: we look it up by walking the recipe steps for the work order.
-                if let Ok(wo) = api::get::<crate::types::WorkOrder>(
+                // Offline-first GETs: the recipe-step screen is the hottest
+                // path in the field; cached copies let the tech keep working
+                // even when the truck rolls through a dead zone.
+                if let Ok(wo) = offline::get_cached::<crate::types::WorkOrder>(
                     &format!("/api/work-orders/{}", wo_id),
                     &state,
                 )
                 .await
                 {
                     if let Some(rid) = wo.recipe_id {
-                        if let Ok(env) = api::get::<DataEnvelope<RecipeStep>>(
+                        if let Ok(env) = offline::get_cached::<DataEnvelope<RecipeStep>>(
                             &format!("/api/recipes/{}/steps", rid),
                             &state,
                         )
@@ -74,7 +77,7 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                     }
                 }
                 // Tip cards
-                if let Ok(env) = api::get::<DataEnvelope<TipCard>>(
+                if let Ok(env) = offline::get_cached::<DataEnvelope<TipCard>>(
                     &format!("/api/steps/{}/tip-cards", step_id),
                     &state,
                 )
@@ -84,7 +87,7 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                 }
                 // Step timers — real backend-defined timers. Multiple concurrent
                 // rings, each with its own duration and alert_type.
-                if let Ok(env) = api::get::<DataEnvelope<StepTimer>>(
+                if let Ok(env) = offline::get_cached::<DataEnvelope<StepTimer>>(
                     &format!("/api/steps/{}/timers", step_id),
                     &state,
                 )
@@ -94,7 +97,7 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                 }
                 // Progress + persisted timer snapshot: restore running state so
                 // pause/resume across device boots works deterministically.
-                if let Ok(env) = api::get::<DataEnvelope<StepProgressDetail>>(
+                if let Ok(env) = offline::get_cached::<DataEnvelope<StepProgressDetail>>(
                     &format!("/api/work-orders/{}/progress", wo_id),
                     &state,
                 )
@@ -179,10 +182,17 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                     "timer_state": timer_state,
                 });
                 let url = format!("/api/work-orders/{}/steps/{}/progress", wo_id, step_id);
-                match api::put::<_, StepProgress>(&url, &body, &state).await {
-                    Ok(p) => {
-                        progress.set(Some(p));
+                match offline::mutate_with_queue(Method::PUT, &url, &body, &state).await {
+                    Ok(Some(v)) => {
+                        if let Ok(p) = serde_json::from_value::<StepProgress>(v) {
+                            progress.set(Some(p));
+                        }
                         toast_ok(&toasts, "Progress saved");
+                    }
+                    Ok(None) => {
+                        // Queued offline — server will resolve via the merge
+                        // policy on reconnect. Keep local UI state coherent.
+                        toast_ok(&toasts, "Progress queued (offline)");
                     }
                     Err(e) => toast_err(&toasts, e.message),
                 }
@@ -273,7 +283,7 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
 // Local, more complete version of StepProgress for decoding the timer
 // snapshot field (the shared `StepProgress` in types.rs intentionally omits it
 // to keep reads lean).
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 struct StepProgressDetail {
     id: Uuid,
     work_order_id: Uuid,

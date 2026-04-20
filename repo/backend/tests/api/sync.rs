@@ -69,6 +69,79 @@ async fn changes_invalid_cursor_returns_400() {
 }
 
 #[actix_web::test]
+async fn changes_tech_only_sees_own_work_order_rows() {
+    // Tech A is assigned to wo_a; Tech B to wo_b. Seed a sync_log row for
+    // each work order and verify Tech A only ever sees wo_a's id in the
+    // response — no metadata leak of wo_b's uuid via sync_log.
+    let ctx = setup().await;
+    sqlx::query(
+        "INSERT INTO sync_log (entity_table, entity_id, operation)
+         VALUES ('work_orders', $1, 'UPDATE'),
+                ('work_orders', $2, 'UPDATE')",
+    )
+    .bind(ctx.wo_a_id)
+    .bind(ctx.wo_b_id)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/sync/changes")
+        .insert_header(auth_header(&ctx.tech_a_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["entity_table"] == "work_orders")
+        .map(|r| r["entity_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&ctx.wo_a_id.to_string()));
+    assert!(
+        !ids.contains(&ctx.wo_b_id.to_string()),
+        "Tech A must not see wo_b's entity_id"
+    );
+}
+
+#[actix_web::test]
+async fn changes_super_scoped_to_branch() {
+    // super_a is bound to branch A. Seeding sync_log for wo_a (branch A)
+    // and wo_b (branch B) — super_a must only see wo_a.
+    let ctx = setup().await;
+    sqlx::query(
+        "INSERT INTO sync_log (entity_table, entity_id, operation)
+         VALUES ('work_orders', $1, 'UPDATE'),
+                ('work_orders', $2, 'UPDATE')",
+    )
+    .bind(ctx.wo_a_id)
+    .bind(ctx.wo_b_id)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    let app = make_service(&ctx).await;
+    let req = TestRequest::get()
+        .uri("/api/sync/changes")
+        .insert_header(auth_header(&ctx.super_token))
+        .to_request();
+    let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
+    assert_eq!(status, 200);
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["entity_table"] == "work_orders")
+        .map(|r| r["entity_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&ctx.wo_a_id.to_string()));
+    assert!(
+        !ids.contains(&ctx.wo_b_id.to_string()),
+        "branch-scoped super must not see wo_b's id"
+    );
+}
+
+#[actix_web::test]
 async fn soft_delete_propagates_as_delete_sync_log() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
@@ -195,16 +268,21 @@ async fn post_step_progress_rejects_older_version() {
 }
 
 #[actix_web::test]
-async fn post_step_progress_flags_conflict_on_equal_version_different_payload() {
+async fn post_step_progress_flags_conflict_on_equal_version_equal_timestamp_different_payload() {
+    // With the PRD §8 timestamp-priority rule in place, only a *strictly equal*
+    // updated_at (plus equal version, divergent payload) is ambiguous enough
+    // to escalate. Pin both sides to the same instant to hit that branch.
     let ctx = setup().await;
     let step = ctx.step_ids[0];
+    let pinned_ts = "2026-04-18T00:00:00Z";
     sqlx::query(
         "INSERT INTO job_step_progress
-            (work_order_id, step_id, status, notes, version)
-         VALUES ($1, $2, 'InProgress', 'local note', 7)",
+            (work_order_id, step_id, status, notes, version, updated_at)
+         VALUES ($1, $2, 'InProgress', 'local note', 7, $3::timestamptz)",
     )
     .bind(ctx.wo_a_id)
     .bind(step)
+    .bind(pinned_ts)
     .execute(&ctx.pool)
     .await
     .unwrap();
@@ -220,7 +298,7 @@ async fn post_step_progress_flags_conflict_on_equal_version_different_payload() 
             "notes": "conflicting note",
             "timer_state_snapshot": null,
             "version": 7,                      // same version
-            "updated_at": "2026-04-18T00:00:00Z"
+            "updated_at": pinned_ts            // same timestamp → genuine tie
         }))
         .to_request();
     let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;

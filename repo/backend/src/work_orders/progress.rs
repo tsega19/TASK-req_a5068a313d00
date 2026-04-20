@@ -13,6 +13,7 @@ use crate::enums::StepProgressStatus;
 use crate::errors::ApiError;
 use crate::etag;
 use crate::middleware::rbac::AuthedUser;
+use crate::processing_log;
 use crate::work_orders::routes::load_visible;
 use crate::log_info;
 
@@ -141,7 +142,7 @@ pub async fn upsert_progress(
                  SET status = $1, notes = COALESCE($2, notes),
                      timer_state_snapshot = COALESCE($3, timer_state_snapshot),
                      started_at = $4, paused_at = $5, completed_at = $6,
-                     etag = $7, version = $8
+                     etag = $7, version = $8, updated_at = NOW()
                  WHERE id = $9
                  RETURNING id, work_order_id, step_id, status, started_at, paused_at,
                            completed_at, notes, timer_state_snapshot, etag, version",
@@ -200,6 +201,21 @@ pub async fn upsert_progress(
         }
     };
 
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::STEP_PROGRESS_UPSERT,
+        "job_step_progress",
+        Some(row.id),
+        json!({
+            "work_order_id": wo_id,
+            "step_id": step_id,
+            "status": format!("{:?}", req.status),
+            "version": row.version,
+            "timer_state_present": req.timer_state.is_some(),
+        }),
+    )
+    .await?;
     tx.commit().await?;
     log_info!(
         MODULE,

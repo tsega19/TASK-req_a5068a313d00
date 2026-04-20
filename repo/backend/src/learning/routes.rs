@@ -16,9 +16,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::models::Role;
+use crate::config::AppConfig;
 use crate::errors::ApiError;
 use crate::log_info;
 use crate::middleware::rbac::{require_any_role, require_role, AuthedUser};
+use crate::processing_log;
 
 const MODULE: &str = "learning";
 
@@ -166,6 +168,7 @@ pub async fn create_knowledge_point(
             "quiz_question requires quiz_options and quiz_correct_answer".into(),
         ));
     }
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, KnowledgePoint>(
         "INSERT INTO knowledge_points
             (recipe_id, step_id, title, content, quiz_question, quiz_options, quiz_correct_answer)
@@ -180,8 +183,23 @@ pub async fn create_knowledge_point(
     .bind(&req.quiz_question)
     .bind(&req.quiz_options)
     .bind(&req.quiz_correct_answer)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::KP_CREATE,
+        "knowledge_points",
+        Some(row.id),
+        json!({
+            "recipe_id": row.recipe_id,
+            "step_id": row.step_id,
+            "title": row.title,
+            "quiz": row.quiz_question.is_some(),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "kp_create", "actor={} kp={}", user.user_id(), row.id);
     Ok(HttpResponse::Created().json(row))
 }
@@ -196,6 +214,7 @@ pub async fn update_knowledge_point(
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
     let req = body.into_inner();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, KnowledgePoint>(
         "UPDATE knowledge_points SET
             title               = COALESCE($1, title),
@@ -213,9 +232,25 @@ pub async fn update_knowledge_point(
     .bind(&req.quiz_options)
     .bind(&req.quiz_correct_answer)
     .bind(id)
-    .fetch_optional(pool.get_ref())
+    .fetch_optional(&mut *tx)
     .await?;
     let row = row.ok_or_else(|| ApiError::NotFound("knowledge point not found".into()))?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::KP_UPDATE,
+        "knowledge_points",
+        Some(row.id),
+        json!({
+            "title_changed": req.title.is_some(),
+            "content_changed": req.content.is_some(),
+            "quiz_changed": req.quiz_question.is_some()
+                || req.quiz_options.is_some()
+                || req.quiz_correct_answer.is_some(),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "kp_update", "actor={} kp={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(row))
 }
@@ -228,14 +263,25 @@ pub async fn delete_knowledge_point(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query("DELETE FROM knowledge_points WHERE id = $1")
         .bind(id)
-        .execute(pool.get_ref())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound("knowledge point not found".into()));
     }
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::KP_DELETE,
+        "knowledge_points",
+        Some(id),
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "kp_delete", "actor={} kp={}", user.user_id(), id);
     Ok(HttpResponse::NoContent().finish())
 }
@@ -248,6 +294,7 @@ pub async fn delete_knowledge_point(
 pub async fn record_learning(
     user: AuthedUser,
     pool: web::Data<PgPool>,
+    cfg: web::Data<AppConfig>,
     body: web::Json<RecordLearningBody>,
 ) -> Result<HttpResponse, ApiError> {
     let req = body.into_inner();
@@ -274,6 +321,8 @@ pub async fn record_learning(
         _ => None,
     };
 
+    let mut tx = pool.begin().await?;
+
     // Review path: bump review_count on the most recent record for this user+KP,
     // but keep original score. Insert only if no prior record exists.
     if req.review {
@@ -284,7 +333,7 @@ pub async fn record_learning(
         )
         .bind(user.user_id())
         .bind(kp.id)
-        .fetch_optional(pool.get_ref())
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some((id,)) = existing {
@@ -296,8 +345,21 @@ pub async fn record_learning(
                            quiz_score, time_spent_seconds, review_count, completed_at",
             )
             .bind(id)
-            .fetch_one(pool.get_ref())
+            .fetch_one(&mut *tx)
             .await?;
+            processing_log::record_tx(
+                &mut tx,
+                Some(user.user_id()),
+                processing_log::actions::LEARNING_RECORD_REVIEW,
+                "learning_records",
+                Some(row.id),
+                json!({
+                    "knowledge_point_id": kp.id,
+                    "review_count": row.review_count,
+                }),
+            )
+            .await?;
+            tx.commit().await?;
             log_info!(MODULE, "record_review", "user={} kp={}", user.user_id(), kp.id);
             return Ok(HttpResponse::Ok().json(row));
         }
@@ -316,8 +378,47 @@ pub async fn record_learning(
     .bind(req.work_order_id)
     .bind(quiz_score)
     .bind(req.time_spent_seconds)
-    .fetch_one(pool.get_ref())
+    .fetch_one(&mut *tx)
     .await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::LEARNING_RECORD,
+        "learning_records",
+        Some(row.id),
+        json!({
+            "knowledge_point_id": kp.id,
+            "work_order_id": req.work_order_id,
+            "quiz_score": quiz_score,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+
+    // Post-commit, best-effort REVIEW_RESULT notification to the learner when
+    // their submission was actually graded (i.e. the KP carried a quiz). The
+    // payload carries pass/fail so the UI can render it inline without a
+    // follow-up fetch. A notification failure never rolls back the row.
+    if let Some(score) = quiz_score {
+        let payload = serde_json::json!({
+            "knowledge_point_id": kp.id,
+            "title": kp.title,
+            "quiz_score": score,
+            "passed": score >= 1.0,
+            "work_order_id": req.work_order_id,
+        });
+        if let Err(e) = crate::notifications::stub::send(
+            pool.get_ref(),
+            cfg.get_ref(),
+            user.user_id(),
+            crate::enums::NotificationTemplate::ReviewResult,
+            payload,
+        )
+        .await
+        {
+            log_info!(MODULE, "review_notify_failed", "user={} err={}", user.user_id(), e);
+        }
+    }
 
     log_info!(
         MODULE,
