@@ -259,6 +259,19 @@ pub fn require_any_role(user: &AuthedUser, allowed: &[Role]) -> Result<(), ApiEr
     }
 }
 
+/// Return the caller's branch_id for branch-scoped reads, or a 403 when the
+/// principal has no branch assignment. Scope SQL MUST fail closed for
+/// SUPER/TECH — a null branch claim must never widen to "see everything"
+/// (audit AR-1 High). ADMIN code paths should not call this; they use a
+/// global scope by design.
+pub fn require_branch(user: &AuthedUser) -> Result<uuid::Uuid, ApiError> {
+    user.branch_id().ok_or_else(|| {
+        ApiError::Forbidden(
+            "role requires a branch assignment; contact an administrator".into(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -86,6 +86,14 @@ pub async fn create_user(
             "password must be at least 12 characters".into(),
         ));
     }
+    // Tenant-isolation invariant (PRD §9 / audit AR-1): TECH and SUPER must
+    // carry a branch assignment. Allowing a null-branch principal here would
+    // punch a hole in every branch-scoped read path downstream.
+    if matches!(req.role, Role::Tech | Role::Super) && req.branch_id.is_none() {
+        return Err(ApiError::BadRequest(
+            "branch_id is required for TECH and SUPER roles".into(),
+        ));
+    }
     let hash = hash_password(&req.password, &cfg.auth)?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
@@ -167,6 +175,25 @@ pub async fn update_user(
         _ => None,
     };
     let password_changed = new_hash.is_some();
+    // Tenant-isolation invariant: if the role is being changed to TECH/SUPER,
+    // the target row must have a non-null branch_id after the update. Look up
+    // the existing branch_id and reject when both the effective role is
+    // scoped and the effective branch is null.
+    if let Some(new_role) = req.role {
+        if matches!(new_role, Role::Tech | Role::Super) {
+            let existing_branch: Option<Option<Uuid>> =
+                sqlx::query_scalar("SELECT branch_id FROM users WHERE id = $1 AND deleted_at IS NULL")
+                    .bind(id)
+                    .fetch_optional(pool.get_ref())
+                    .await?;
+            let effective_branch = req.branch_id.or(existing_branch.flatten());
+            if effective_branch.is_none() {
+                return Err(ApiError::BadRequest(
+                    "branch_id is required for TECH and SUPER roles".into(),
+                ));
+            }
+        }
+    }
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
         "UPDATE users SET
@@ -403,6 +430,22 @@ pub async fn trigger_sync(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = sync::trigger(pool.get_ref()).await?;
+    // Closed-loop audit (PRD §7 / audit AR-1 Medium): privileged triggers
+    // leave a processing_log row with actor + summary metadata.
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_SYNC_TRIGGER,
+        "sync_log",
+        None,
+        serde_json::json!({
+            "conflicts_flagged": report.conflicts_flagged,
+            "work_orders_updated": report.work_orders_updated,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "sync_trigger", "actor={} conflicts={}", user.user_id(), report.conflicts_flagged);
     Ok(HttpResponse::Ok().json(report.to_json()))
 }
@@ -415,6 +458,20 @@ pub async fn trigger_retention(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::retention::prune(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_RETENTION_PRUNE,
+        "retention",
+        None,
+        serde_json::json!({
+            "users_pruned": report.users_pruned,
+            "work_orders_pruned": report.work_orders_pruned,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "retention_prune",
@@ -434,6 +491,24 @@ pub async fn trigger_notifications_retry(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::notifications::stub::retry_pending(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_NOTIFICATIONS_RETRY,
+        "notifications",
+        None,
+        serde_json::json!({
+            "scanned": report.scanned,
+            "delivered": report.delivered,
+            "giveup": report.giveup,
+            "skipped_backoff": report.skipped_backoff,
+            "failed_again": report.failed_again,
+            "rate_limited_waiting": report.rate_limited_waiting,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "notifications_retry",
@@ -493,6 +568,21 @@ pub async fn trigger_sla_scan(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::sla::scan_and_alert(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_SLA_SCAN,
+        "work_orders",
+        None,
+        serde_json::json!({
+            "scanned": report.scanned,
+            "alerts_emitted": report.alerts_emitted,
+            "deduped": report.deduped,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "sla_scan",

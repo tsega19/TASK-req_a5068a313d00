@@ -23,9 +23,9 @@ use uuid::Uuid;
 use crate::auth::models::Role;
 use crate::errors::ApiError;
 use crate::log_info;
-use crate::middleware::rbac::{require_any_role, require_role, AuthedUser};
+use crate::middleware::rbac::{require_any_role, require_branch, require_role, AuthedUser};
+use crate::processing_log;
 use crate::sync::merge::{merge_step_progress, resolve_conflict, IncomingProgress, MergeOutcome};
-use crate::sync::log_soft_delete;
 use crate::work_orders::routes::load_visible;
 
 const MODULE: &str = "sync";
@@ -63,6 +63,23 @@ pub async fn post_step_progress(
         return Err(ApiError::Forbidden("not assigned to this work order".into()));
     }
     let outcome = merge_step_progress(pool.get_ref(), &incoming).await?;
+    // Immutable audit (PRD §7 / audit AR-1 Medium): record the push outcome
+    // so operator replays are reconstructible from the processing_log alone.
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::SYNC_PROGRESS_PUSH,
+        "job_step_progress",
+        None,
+        serde_json::json!({
+            "work_order_id": incoming.work_order_id,
+            "step_id": incoming.step_id,
+            "outcome": format!("{:?}", outcome),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "push_progress", "user={} wo={} step={} outcome={:?}",
         user.user_id(), incoming.work_order_id, incoming.step_id, outcome);
     Ok(HttpResponse::Ok().json(MergeResponse::from(outcome)))
@@ -83,15 +100,52 @@ pub async fn list_conflicts(
     pool: web::Data<PgPool>,
 ) -> Result<HttpResponse, ApiError> {
     require_any_role(&user, &[Role::Super, Role::Admin])?;
-    let rows = sqlx::query_as::<_, ConflictRow>(
-        "SELECT id, entity_table, entity_id, new_etag, synced_at
-         FROM sync_log
-         WHERE conflict_flagged = TRUE AND conflict_resolved_by IS NULL
-         ORDER BY synced_at ASC",
-    )
-    .fetch_all(pool.get_ref())
-    .await?;
-    log_info!(MODULE, "conflicts_list", "user={} count={}", user.user_id(), rows.len());
+    // Audit-2 Medium #5: SUPER previously saw every unresolved conflict
+    // regardless of branch. Scope work-order and step-progress conflicts to
+    // the caller's branch; ADMIN sees the full feed. Global entities
+    // (recipes / tip_cards) stay visible to both because they are not
+    // branch-scoped in the schema.
+    let rows = match user.role() {
+        Role::Admin => sqlx::query_as::<_, ConflictRow>(
+            "SELECT id, entity_table, entity_id, new_etag, synced_at
+             FROM sync_log
+             WHERE conflict_flagged = TRUE AND conflict_resolved_by IS NULL
+             ORDER BY synced_at ASC",
+        )
+        .fetch_all(pool.get_ref())
+        .await?,
+        Role::Super => {
+            let branch = require_branch(&user)?;
+            sqlx::query_as::<_, ConflictRow>(
+                "SELECT s.id, s.entity_table, s.entity_id, s.new_etag, s.synced_at
+                 FROM sync_log s
+                 WHERE s.conflict_flagged = TRUE
+                   AND s.conflict_resolved_by IS NULL
+                   AND (
+                     s.entity_table IN ('recipes', 'tip_cards')
+                     OR (
+                       s.entity_table = 'work_orders' AND EXISTS (
+                         SELECT 1 FROM work_orders w
+                         WHERE w.id = s.entity_id AND w.branch_id = $1
+                       )
+                     )
+                     OR (
+                       s.entity_table = 'job_step_progress' AND EXISTS (
+                         SELECT 1 FROM job_step_progress p
+                         JOIN work_orders w ON w.id = p.work_order_id
+                         WHERE p.id = s.entity_id AND w.branch_id = $1
+                       )
+                     )
+                   )
+                 ORDER BY s.synced_at ASC",
+            )
+            .bind(branch)
+            .fetch_all(pool.get_ref())
+            .await?
+        }
+        Role::Tech => unreachable!("require_any_role above rejects TECH"),
+    };
+    log_info!(MODULE, "conflicts_list", "user={} role={} count={}", user.user_id(), user.role(), rows.len());
     Ok(HttpResponse::Ok().json(serde_json::json!({ "data": rows, "total": rows.len() })))
 }
 
@@ -113,7 +167,49 @@ pub async fn post_resolve_conflict(
     if !body.acknowledged {
         return Err(ApiError::BadRequest("acknowledged=true required".into()));
     }
+    // Audit-2 Medium #5: a SUPER must only acknowledge conflicts for their
+    // own branch. We 404 (not 403) on scope miss to avoid leaking which IDs
+    // exist in other branches.
+    if matches!(user.role(), Role::Super) {
+        let branch = require_branch(&user)?;
+        let in_scope: Option<bool> = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sync_log s
+                 WHERE s.id = $1
+                   AND (
+                     s.entity_table IN ('recipes', 'tip_cards')
+                     OR (s.entity_table = 'work_orders' AND EXISTS (
+                         SELECT 1 FROM work_orders w
+                         WHERE w.id = s.entity_id AND w.branch_id = $2))
+                     OR (s.entity_table = 'job_step_progress' AND EXISTS (
+                         SELECT 1 FROM job_step_progress p
+                         JOIN work_orders w ON w.id = p.work_order_id
+                         WHERE p.id = s.entity_id AND w.branch_id = $2))
+                   )
+             )",
+        )
+        .bind(id)
+        .bind(branch)
+        .fetch_optional(pool.get_ref())
+        .await?;
+        if !in_scope.unwrap_or(false) {
+            return Err(ApiError::NotFound("conflict not found".into()));
+        }
+    }
     resolve_conflict(pool.get_ref(), id, user.user_id()).await?;
+    // Audit row for the conflict acknowledgement (PRD §7 / audit AR-1 Medium).
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::SYNC_CONFLICT_RESOLVE,
+        "sync_log",
+        Some(id),
+        serde_json::json!({ "acknowledged": true }),
+    )
+    .await?;
+    tx.commit().await?;
+    log_info!(MODULE, "conflict_resolve", "user={} sync_log_id={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(serde_json::json!({ "resolved": true })))
 }
 
@@ -189,39 +285,44 @@ pub async fn list_changes(
         .fetch_all(pool.get_ref())
         .await?,
 
-        Role::Super => sqlx::query_as::<_, ChangeRow>(
-            "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
-                    s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
-             FROM sync_log s
-             WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
-               AND ($2::text IS NULL OR s.entity_table = $2)
-               AND (
-                 s.entity_table IN ('recipes', 'tip_cards')
-                 OR (
-                   s.entity_table = 'work_orders' AND EXISTS (
-                     SELECT 1 FROM work_orders w
-                     WHERE w.id = s.entity_id
-                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
+        Role::Super => {
+            // Fail-closed (audit AR-1 High): a SUPER without a branch claim
+            // would have widened through both the `$3 IS NULL` escape and the
+            // `w.branch_id IS NULL` leg, leaking cross-branch UUIDs. Require
+            // the branch and match strictly.
+            let branch = require_branch(&user)?;
+            sqlx::query_as::<_, ChangeRow>(
+                "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
+                        s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
+                 FROM sync_log s
+                 WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
+                   AND ($2::text IS NULL OR s.entity_table = $2)
+                   AND (
+                     s.entity_table IN ('recipes', 'tip_cards')
+                     OR (
+                       s.entity_table = 'work_orders' AND EXISTS (
+                         SELECT 1 FROM work_orders w
+                         WHERE w.id = s.entity_id AND w.branch_id = $3
+                       )
+                     )
+                     OR (
+                       s.entity_table = 'job_step_progress' AND EXISTS (
+                         SELECT 1 FROM job_step_progress p
+                         JOIN work_orders w ON w.id = p.work_order_id
+                         WHERE p.id = s.entity_id AND w.branch_id = $3
+                       )
+                     )
                    )
-                 )
-                 OR (
-                   s.entity_table = 'job_step_progress' AND EXISTS (
-                     SELECT 1 FROM job_step_progress p
-                     JOIN work_orders w ON w.id = p.work_order_id
-                     WHERE p.id = s.entity_id
-                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
-                   )
-                 )
-               )
-             ORDER BY s.synced_at ASC
-             LIMIT $4",
-        )
-        .bind(since)
-        .bind(q.entity.as_deref())
-        .bind(user.branch_id())
-        .bind(limit)
-        .fetch_all(pool.get_ref())
-        .await?,
+                 ORDER BY s.synced_at ASC
+                 LIMIT $4",
+            )
+            .bind(since)
+            .bind(q.entity.as_deref())
+            .bind(branch)
+            .bind(limit)
+            .fetch_all(pool.get_ref())
+            .await?
+        }
 
         Role::Tech => sqlx::query_as::<_, ChangeRow>(
             "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
@@ -295,18 +396,31 @@ pub async fn push_work_order_delete(
     // Soft-delete propagation must be ADMIN; matches the live DELETE handler.
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
+    // Run the soft-delete + sync_log + processing_log writes atomically so a
+    // partial failure doesn't leave an untracked propagation (audit AR-1 Medium).
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE work_orders SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW()
          WHERE id = $1",
     )
     .bind(id)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound("work order not found".into()));
     }
-    log_soft_delete(pool.get_ref(), "work_orders", id).await?;
+    crate::sync::log_soft_delete_tx(&mut tx, "work_orders", id).await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::SYNC_WO_DELETE_PUSH,
+        "work_orders",
+        Some(id),
+        serde_json::json!({ "propagated": true }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "push_delete", "user={} wo={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true, "entity_table": "work_orders", "entity_id": id })))
 }

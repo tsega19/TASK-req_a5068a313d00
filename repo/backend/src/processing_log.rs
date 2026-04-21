@@ -19,6 +19,9 @@ pub mod actions {
     pub const WO_CREATE: &str = "work_order.create";
     pub const WO_TRANSITION: &str = "work_order.transition";
     pub const WO_DELETE: &str = "work_order.delete";
+    /// Automatic on-call routing decision flipped on create or transition
+    /// (audit-2 High #2). Emitted only when the value changes.
+    pub const WO_ON_CALL_ROUTED: &str = "work_order.on_call.routed";
     pub const STEP_PROGRESS_UPSERT: &str = "step_progress.upsert";
     pub const CHECK_IN: &str = "check_in.create";
     pub const TRAIL_POINT: &str = "location_trail.append";
@@ -47,6 +50,15 @@ pub mod actions {
     pub const ME_HOME_ADDRESS_SET: &str = "me.home_address.set";
     // Notifications
     pub const NOTIFICATION_UNSUBSCRIBE: &str = "notification.unsubscribe";
+    // Privileged operator / admin triggers (PRD §7 audit coverage)
+    pub const ADMIN_SYNC_TRIGGER: &str = "admin.sync.trigger";
+    pub const ADMIN_RETENTION_PRUNE: &str = "admin.retention.prune";
+    pub const ADMIN_NOTIFICATIONS_RETRY: &str = "admin.notifications.retry";
+    pub const ADMIN_SLA_SCAN: &str = "admin.sla.scan";
+    // Sync operator actions that mutate durable state
+    pub const SYNC_PROGRESS_PUSH: &str = "sync.progress.push";
+    pub const SYNC_CONFLICT_RESOLVE: &str = "sync.conflict.resolve";
+    pub const SYNC_WO_DELETE_PUSH: &str = "sync.work_order.delete_push";
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
