@@ -138,11 +138,6 @@ pub struct WorkOrder {
     pub location_lng: Option<f64>,
     pub etag: Option<String>,
     pub version_count: i32,
-    /// Automatic on-call routing decision (audit-2 High #2). Populated by
-    /// the backend on create and state transitions; exposed so the UI can
-    /// render an on-call badge without re-evaluating the rule client-side.
-    #[serde(default)]
-    pub on_call: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -214,10 +209,6 @@ pub struct StepProgress {
     pub status: StepProgressStatus,
     pub notes: Option<String>,
     pub version: i32,
-    /// Current SHA-256 ETag — needed for the `If-Match` header on subsequent
-    /// updates (audit-2 High #3).
-    #[serde(default)]
-    pub etag: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

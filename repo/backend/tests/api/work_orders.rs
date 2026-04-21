@@ -1,10 +1,7 @@
 use actix_web::test::TestRequest;
 use serde_json::json;
 
-use super::common::{
-    auth_header, if_match_header, json_of, make_service, progress_etag, raw_of, setup, status_of,
-    wo_etag,
-};
+use super::common::{auth_header, json_of, make_service, raw_of, setup, status_of};
 
 #[actix_web::test]
 async fn admin_lists_all_work_orders() {
@@ -110,11 +107,9 @@ async fn create_wo_rejects_location_outside_branch_radius() {
 async fn transition_scheduled_to_enroute_requires_gps() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "to_state": "EnRoute" }))
         .to_request();
     assert_eq!(status_of(&app, req).await, 400);
@@ -124,11 +119,9 @@ async fn transition_scheduled_to_enroute_requires_gps() {
 async fn transition_happy_path_scheduled_to_enroute() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "to_state": "EnRoute", "lat": 37.77, "lng": -122.42 }))
         .to_request();
     let (status, body) = raw_of(&app, req).await;
@@ -141,11 +134,9 @@ async fn transition_happy_path_scheduled_to_enroute() {
 async fn tech_cannot_cancel_work_order() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "to_state": "Canceled", "notes": "x" }))
         .to_request();
     assert_eq!(status_of(&app, req).await, 403);
@@ -155,11 +146,9 @@ async fn tech_cannot_cancel_work_order() {
 async fn super_cancels_with_notes() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.super_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "to_state": "Canceled", "notes": "unreachable customer" }))
         .to_request();
     let (status, body) = raw_of(&app, req).await;
@@ -171,11 +160,9 @@ async fn super_cancels_with_notes() {
 async fn super_cancel_without_notes_is_400() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.super_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "to_state": "Canceled" }))
         .to_request();
     assert_eq!(status_of(&app, req).await, 400);
@@ -190,11 +177,9 @@ async fn timeline_reflects_transitions_with_body_content() {
     let ctx = setup().await;
     // Drive Scheduled -> EnRoute as tech_a via the state endpoint.
     let app0 = make_service(&ctx).await;
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let trans = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({
             "to_state": "EnRoute",
             "lat": 37.7749,
@@ -332,42 +317,11 @@ async fn super_cannot_soft_delete_work_order() {
 }
 
 #[actix_web::test]
-async fn state_transition_rejects_missing_if_match_with_412() {
-    // Audit-2 High #3: the mutating state transition endpoint must refuse
-    // payloads without an `If-Match` header so lost-update races are caught
-    // at the edge.
-    let ctx = setup().await;
-    let app = make_service(&ctx).await;
-    let req = TestRequest::put()
-        .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
-        .insert_header(auth_header(&ctx.tech_a_token))
-        .set_json(json!({ "to_state": "EnRoute", "lat": 37.77, "lng": -122.42 }))
-        .to_request();
-    assert_eq!(status_of(&app, req).await, 412);
-}
-
-#[actix_web::test]
-async fn state_transition_rejects_stale_if_match_with_412() {
-    // Audit-2 High #3: a stale ETag (e.g. after another editor committed)
-    // must surface as 412 so the client refetches before retrying.
-    let ctx = setup().await;
-    let app = make_service(&ctx).await;
-    let req = TestRequest::put()
-        .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
-        .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header("deadbeefdeadbeef"))
-        .set_json(json!({ "to_state": "EnRoute", "lat": 37.77, "lng": -122.42 }))
-        .to_request();
-    assert_eq!(status_of(&app, req).await, 412);
-}
-
-#[actix_web::test]
 async fn step_progress_upsert_creates_then_updates() {
     let ctx = setup().await;
     let step_id = ctx.step_ids[0];
     let app = make_service(&ctx).await;
 
-    // First write has no prior row, so If-Match is not required.
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/steps/{}/progress", ctx.wo_a_id, step_id))
         .insert_header(auth_header(&ctx.tech_a_token))
@@ -378,13 +332,10 @@ async fn step_progress_upsert_creates_then_updates() {
     assert_eq!(body["status"], "InProgress");
     assert_eq!(body["version"], 1);
 
-    // Second write MUST pass the current progress ETag (audit-2 High #3).
     let app2 = make_service(&ctx).await;
-    let etag = progress_etag(&ctx.pool, ctx.wo_a_id, step_id).await;
     let req2 = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/steps/{}/progress", ctx.wo_a_id, step_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({ "status": "Completed", "notes": "done" }))
         .to_request();
     let (status2, body2) = raw_of(&app2, req2).await;

@@ -14,24 +14,12 @@ const MIN_PASSWORD_LEN: usize = 12;
 /// Returns Ok when the create-user form can be submitted; Err with a user-
 /// facing reason otherwise. Separating this from the event handler lets the
 /// #[cfg(test)] module below pin the contract without spinning up a DOM.
-///
-/// `branch_id` is the currently-selected branch. TECH and SUPER MUST have a
-/// branch (mirrors the backend validation added for audit-2 Blocker #1 —
-/// the server rejects the payload otherwise).
-pub(crate) fn validate_create_user(
-    username: &str,
-    password: &str,
-    role: &str,
-    branch_id: Option<&str>,
-) -> Result<(), &'static str> {
+pub(crate) fn validate_create_user(username: &str, password: &str) -> Result<(), &'static str> {
     if username.trim().is_empty() {
         return Err("Username is required");
     }
     if password.len() < MIN_PASSWORD_LEN {
         return Err("Username + password (\u{2265}12 chars) required");
-    }
-    if matches!(role, "TECH" | "SUPER") && branch_id.map(str::trim).unwrap_or("").is_empty() {
-        return Err("Branch is required for TECH and SUPER users");
     }
     Ok(())
 }
@@ -71,20 +59,16 @@ fn users_section() -> Html {
     let auth = use_context::<AuthCtx>().expect("auth ctx");
     let toasts = use_context::<ToastCtx>().expect("toast ctx");
     let users = use_state(Vec::<AdminUser>::new);
-    let branches = use_state(Vec::<Branch>::new);
     let loading = use_state(|| true);
     let reload = use_state(|| 0u32);
 
     let username = use_state(String::new);
     let password = use_state(String::new);
     let role = use_state(|| "TECH".to_string());
-    // Empty string = "no branch selected"; serialized as a UUID when populated.
-    let branch_id = use_state(String::new);
     let creating = use_state(|| false);
 
     {
         let users = users.clone();
-        let branches = branches.clone();
         let loading = loading.clone();
         let auth = auth.clone();
         let toasts = toasts.clone();
@@ -96,11 +80,6 @@ fn users_section() -> Html {
                 match api::get::<Paginated<AdminUser>>("/api/admin/users?per_page=200", &state).await {
                     Ok(p) => users.set(p.data),
                     Err(e) => toast_err(&toasts, format!("Users: {}", e.message)),
-                }
-                // Branches populate the required selector for TECH/SUPER.
-                match api::get::<Paginated<Branch>>("/api/admin/branches?per_page=200", &state).await {
-                    Ok(p) => branches.set(p.data),
-                    Err(e) => toast_err(&toasts, format!("Branches: {}", e.message)),
                 }
                 loading.set(false);
             });
@@ -116,20 +95,13 @@ fn users_section() -> Html {
         let username = username.clone();
         let password = password.clone();
         let role = role.clone();
-        let branch_id = branch_id.clone();
         Callback::from(move |_| {
             if *creating {
                 return;
             }
             // Mirrors backend rule in backend/src/admin/routes.rs — a weaker
             // client rule just produces predictable 400s and operator confusion.
-            let branch_val = (*branch_id).clone();
-            let branch_opt = if branch_val.trim().is_empty() {
-                None
-            } else {
-                Some(branch_val.as_str())
-            };
-            if let Err(msg) = validate_create_user(&username, &password, &role, branch_opt) {
+            if let Err(msg) = validate_create_user(&username, &password) {
                 toast_err(&toasts, msg);
                 return;
             }
@@ -143,25 +115,18 @@ fn users_section() -> Html {
             let role_val = (*role).clone();
             let username = username.clone();
             let password = password.clone();
-            let branch_id = branch_id.clone();
             let reload_val = *reload;
             wasm_bindgen_futures::spawn_local(async move {
-                let mut body = serde_json::json!({
+                let body = serde_json::json!({
                     "username": username_val,
                     "password": password_val,
                     "role": role_val,
                 });
-                // Only send branch_id when it's a parseable UUID — stops the
-                // "admin with junk branch" failure mode at the client edge.
-                if let Ok(uuid) = branch_val.parse::<uuid::Uuid>() {
-                    body["branch_id"] = serde_json::json!(uuid);
-                }
                 match api::post::<_, serde_json::Value>("/api/admin/users", &body, &state).await {
                     Ok(_) => {
                         toast_ok(&toasts, "User created");
                         username.set(String::new());
                         password.set(String::new());
-                        branch_id.set(String::new());
                         reload.set(reload_val + 1);
                     }
                     Err(e) => toast_err(&toasts, e.message),
@@ -195,8 +160,6 @@ fn users_section() -> Html {
     let on_user = text_input(username.clone());
     let on_pass = text_input(password.clone());
     let on_role = select_input(role.clone());
-    let on_branch = select_input(branch_id.clone());
-    let branch_required = matches!(role.as_str(), "TECH" | "SUPER");
 
     html! {
         <div class="card">
@@ -209,15 +172,6 @@ fn users_section() -> Html {
                         <option value="TECH">{ "TECH" }</option>
                         <option value="SUPER">{ "SUPER" }</option>
                         <option value="ADMIN">{ "ADMIN" }</option>
-                    </select>
-                </label>
-                <label>
-                    { if branch_required { "Branch *" } else { "Branch (optional)" } }
-                    <select value={(*branch_id).clone()} onchange={on_branch}>
-                        <option value="">{ "— none —" }</option>
-                        { for branches.iter().map(|b| html!{
-                            <option value={b.id.to_string()}>{ b.name.clone() }</option>
-                        }) }
                     </select>
                 </label>
                 <LoadingButton label="Create user" loading={*creating} onclick={create_user} />
@@ -532,58 +486,28 @@ mod tests {
 
     // Configure is centralized in types.rs; see the note there.
 
-    // Canonical branch id used by the test fixtures — its actual value is
-    // irrelevant, only that it is non-empty.
-    const TEST_BRANCH: &str = "11111111-1111-1111-1111-111111111111";
-
     #[wasm_bindgen_test]
     fn create_user_rejects_empty_username() {
-        let err = validate_create_user("", "a-long-enough-password", "ADMIN", None).unwrap_err();
+        let err = validate_create_user("", "a-long-enough-password").unwrap_err();
         assert!(err.contains("Username"), "got: {}", err);
         // Whitespace-only username is also empty.
-        assert!(validate_create_user("   ", "a-long-enough-password", "ADMIN", None).is_err());
+        assert!(validate_create_user("   ", "a-long-enough-password").is_err());
     }
 
     #[wasm_bindgen_test]
     fn create_user_rejects_short_password_matching_backend_rule() {
         // Backend (backend/src/admin/routes.rs) rejects <12. The frontend
         // must agree so the operator never ships a doomed request.
-        assert!(validate_create_user("alice", "short", "ADMIN", None).is_err());
+        assert!(validate_create_user("alice", "short").is_err());
         // 11-char password — one below the floor.
-        assert!(validate_create_user("alice", "elevenchars", "ADMIN", None).is_err());
+        assert!(validate_create_user("alice", "elevenchars").is_err());
         // Exactly MIN_PASSWORD_LEN (12) is accepted.
         assert_eq!("twelvecharsx".len(), MIN_PASSWORD_LEN);
-        assert!(validate_create_user("alice", "twelvecharsx", "ADMIN", None).is_ok());
+        assert!(validate_create_user("alice", "twelvecharsx").is_ok());
     }
 
     #[wasm_bindgen_test]
-    fn create_user_accepts_admin_without_branch() {
-        // ADMIN is a global role; no branch required.
-        assert!(validate_create_user("alice", "plenty-long-password", "ADMIN", None).is_ok());
-        assert!(validate_create_user("alice", "plenty-long-password", "ADMIN", Some("")).is_ok());
-    }
-
-    #[wasm_bindgen_test]
-    fn create_user_requires_branch_for_tech_and_super() {
-        // Mirrors backend validation (audit-2 Blocker #1): TECH and SUPER
-        // payloads MUST include a branch_id.
-        for role in ["TECH", "SUPER"] {
-            assert!(
-                validate_create_user("alice", "plenty-long-password", role, None).is_err(),
-                "{} without branch should be rejected", role
-            );
-            assert!(
-                validate_create_user("alice", "plenty-long-password", role, Some("")).is_err(),
-                "{} with blank branch should be rejected", role
-            );
-            assert!(
-                validate_create_user("alice", "plenty-long-password", role, Some("   ")).is_err(),
-                "{} with whitespace-only branch should be rejected", role
-            );
-            assert!(
-                validate_create_user("alice", "plenty-long-password", role, Some(TEST_BRANCH)).is_ok(),
-                "{} with a branch should be accepted", role
-            );
-        }
+    fn create_user_accepts_happy_path() {
+        assert!(validate_create_user("alice", "plenty-long-password").is_ok());
     }
 }

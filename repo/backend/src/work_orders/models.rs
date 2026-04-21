@@ -20,12 +20,6 @@ pub struct WorkOrder {
     pub location_lng: Option<f64>,
     pub etag: Option<String>,
     pub version_count: i32,
-    /// Populated by the automatic on-call router: true when priority=HIGH and
-    /// the SLA deadline is within the configured on-call window. Flipped on
-    /// create and on every state transition (see `work_orders::routes::
-    /// evaluate_on_call`). Supervisors read this directly instead of
-    /// recomputing the rule on each `/on-call-queue` query (PRD §7).
-    pub on_call: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,

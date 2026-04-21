@@ -112,7 +112,6 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                             status: p.status.clone(),
                             notes: p.notes.clone(),
                             version: p.version,
-                            etag: p.etag.clone(),
                         }));
                         // Try to decode persisted per-timer snapshots.
                         if let Some(snap_val) = p.timer_state_snapshot {
@@ -168,11 +167,6 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
             let saving = saving.clone();
             let notes_val = (*notes).clone();
             let progress = progress.clone();
-            // Pin the ETag of the currently-known progress row so the upsert
-            // can send If-Match (audit-2 High #3 / PRD §8). First-time writes
-            // have no prior row and therefore no ETag — the backend accepts
-            // those without the header.
-            let if_match = progress.as_ref().and_then(|p| p.etag.clone());
             // Collect current timer snapshot as a stable vector ordered by id.
             let mut snap_vec: Vec<TimerSnapshot> = snapshots.values().cloned().collect();
             snap_vec.sort_by_key(|s| s.timer_id);
@@ -188,15 +182,7 @@ pub fn recipe_step_page(props: &StepProps) -> Html {
                     "timer_state": timer_state,
                 });
                 let url = format!("/api/work-orders/{}/steps/{}/progress", wo_id, step_id);
-                match offline::mutate_with_queue_if_match(
-                    Method::PUT,
-                    &url,
-                    &body,
-                    &state,
-                    if_match.as_deref(),
-                )
-                .await
-                {
+                match offline::mutate_with_queue(Method::PUT, &url, &body, &state).await {
                     Ok(Some(v)) => {
                         if let Ok(p) = serde_json::from_value::<StepProgress>(v) {
                             progress.set(Some(p));
@@ -306,6 +292,4 @@ struct StepProgressDetail {
     notes: Option<String>,
     timer_state_snapshot: Option<serde_json::Value>,
     version: i32,
-    #[serde(default)]
-    etag: Option<String>,
 }

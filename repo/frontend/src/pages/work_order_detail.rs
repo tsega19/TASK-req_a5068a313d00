@@ -394,10 +394,6 @@ fn transition_panel(props: &TransitionPanelProps) -> Html {
         let lat_in = lat_in.clone();
         let lng_in = lng_in.clone();
         let id = props.wo.id;
-        // Pin the current ETag at the moment the UI was rendered — the
-        // transition must pass it via If-Match so the backend can 412 a
-        // stale write (audit-2 High #3 / PRD §8).
-        let etag = props.wo.etag.clone();
         Callback::from(move |to: WorkOrderState| {
             if *transitioning {
                 return;
@@ -421,7 +417,6 @@ fn transition_panel(props: &TransitionPanelProps) -> Html {
             let notes_val = (*notes).clone();
             let lat = parse_coord(&lat_in);
             let lng = parse_coord(&lng_in);
-            let etag = etag.clone();
             notes.set(String::new());
             wasm_bindgen_futures::spawn_local(async move {
                 let body = serde_json::json!({
@@ -431,15 +426,7 @@ fn transition_panel(props: &TransitionPanelProps) -> Html {
                     "lng": lng,
                 });
                 let url = format!("/api/work-orders/{}/state", id);
-                match offline::mutate_with_queue_if_match(
-                    Method::PUT,
-                    &url,
-                    &body,
-                    &state,
-                    etag.as_deref(),
-                )
-                .await
-                {
+                match offline::mutate_with_queue(Method::PUT, &url, &body, &state).await {
                     Ok(Some(_)) => {
                         toast_ok(&toasts, format!("Moved to {:?}", to));
                         on_changed.emit(());

@@ -368,34 +368,11 @@ pub async fn mutate_with_queue(
     body: &serde_json::Value,
     auth: &AuthState,
 ) -> Result<Option<serde_json::Value>, ApiError> {
-    mutate_with_queue_if_match(method, path, body, auth, None).await
-}
-
-/// Variant of `mutate_with_queue` that propagates an `If-Match` header when
-/// one is supplied. For PRD §8 optimistic concurrency: work-order state and
-/// step-progress updates use this so the server can 412 a stale write. A
-/// queued (offline) request carries the best-known ETag at enqueue time —
-/// on replay the server may reject it, which surfaces as a normal error.
-pub async fn mutate_with_queue_if_match(
-    method: Method,
-    path: &str,
-    body: &serde_json::Value,
-    auth: &AuthState,
-    if_match: Option<&str>,
-) -> Result<Option<serde_json::Value>, ApiError> {
     if !is_online() {
         enqueue(method, path, body.clone());
         return Ok(None);
     }
-    match api::send_json_with_if_match::<_, serde_json::Value>(
-        method.clone(),
-        path,
-        body,
-        auth,
-        if_match,
-    )
-    .await
-    {
+    match api::send_json::<_, serde_json::Value>(method.clone(), path, body, auth).await {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.status == 0 => {
             enqueue(method, path, body.clone());

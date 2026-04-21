@@ -5,7 +5,7 @@
 use actix_web::test::TestRequest;
 use serde_json::json;
 
-use super::common::{auth_header, if_match_header, raw_of, setup, status_of, wo_etag};
+use super::common::{auth_header, raw_of, setup, status_of};
 
 #[actix_web::test]
 async fn state_transition_writes_processing_log_row() {
@@ -13,11 +13,9 @@ async fn state_transition_writes_processing_log_row() {
     let app = super::common::make_service(&ctx).await;
 
     // Tech A transitions WO-A Scheduled -> EnRoute.
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.tech_a_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({
             "to_state": "EnRoute",
             "notes": "heading out",

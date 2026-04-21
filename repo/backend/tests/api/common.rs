@@ -276,39 +276,3 @@ where
 pub fn auth_header(token: &str) -> (&'static str, String) {
     ("Authorization", format!("Bearer {}", token))
 }
-
-/// Fetch the current work order ETag for use in an `If-Match` header.
-///
-/// Mutation tests must send `If-Match` (audit-2 High #3). The ETag is stored
-/// next to the work-order row, so we pull it straight from the test pool
-/// instead of through the HTTP surface.
-pub async fn wo_etag(pool: &PgPool, id: Uuid) -> String {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT etag FROM work_orders WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await
-    .expect("fetch work_order etag")
-    .expect("work_order has no etag")
-}
-
-/// Fetch the current step-progress ETag for use in an `If-Match` header on
-/// the upsert endpoint.
-pub async fn progress_etag(pool: &PgPool, wo_id: Uuid, step_id: Uuid) -> String {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT etag FROM job_step_progress WHERE work_order_id = $1 AND step_id = $2",
-    )
-    .bind(wo_id)
-    .bind(step_id)
-    .fetch_one(pool)
-    .await
-    .expect("fetch step-progress etag")
-    .expect("step-progress has no etag")
-}
-
-/// Shorthand to build an `If-Match` header tuple consumable by
-/// `TestRequest::insert_header`.
-pub fn if_match_header(etag: &str) -> (&'static str, String) {
-    ("If-Match", etag.to_string())
-}

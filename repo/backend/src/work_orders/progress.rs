@@ -1,6 +1,6 @@
 //! Step progress: list, upsert, and version history pruning.
 
-use actix_web::{get, put, web, HttpRequest, HttpResponse};
+use actix_web::{get, put, web, HttpResponse};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
@@ -14,7 +14,7 @@ use crate::errors::ApiError;
 use crate::etag;
 use crate::middleware::rbac::AuthedUser;
 use crate::processing_log;
-use crate::work_orders::routes::{load_visible, require_if_match};
+use crate::work_orders::routes::load_visible;
 use crate::log_info;
 
 const MODULE: &str = "work_orders";
@@ -65,7 +65,6 @@ pub async fn list_progress(
 
 #[put("/{id}/steps/{step_id}/progress")]
 pub async fn upsert_progress(
-    http_req: HttpRequest,
     user: AuthedUser,
     pool: web::Data<PgPool>,
     cfg: web::Data<AppConfig>,
@@ -94,13 +93,6 @@ pub async fn upsert_progress(
     .bind(step_id)
     .fetch_optional(pool.get_ref())
     .await?;
-
-    // If-Match precondition for UPDATES (audit-2 High #3). First-time inserts
-    // have no prior ETag to match, so the header is only required when a row
-    // already exists. This matches RFC 7232 semantics for upsert semantics.
-    if let Some(prev) = existing.as_ref() {
-        require_if_match(&http_req, prev.etag.as_deref())?;
-    }
 
     let (started_at, paused_at, completed_at) = match req.status {
         StepProgressStatus::Pending => (None, None, None),
