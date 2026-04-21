@@ -1,16 +1,9 @@
 # Delivery Acceptance and Project Architecture Static Audit
 
 ## 1. Verdict
-- “Recipe” timers are not actually sourced from backend configuration; the UI renders preview timers and does not persist timer state. (`repo/frontend/src/pages/recipe_step.rs:96`, `repo/frontend/src/pages/recipe_step.rs:186`)
-- High-risk security defaults are shipped as documented defaults (admin/admin123, hardcoded JWT secret & AES key in compose). (`repo/README.md:31`, `repo/docker-compose.yml:48`, `repo/docker-compose.yml:55`, `repo/docker-compose.yml:76`)
-
----
+- **Overall conclusion: Partial Pass**
 
 ## 2. Scope and Static Verification Boundary
-- Root docs and orchestration: `repo/README.md`, `repo/docker-compose.yml`, `repo/run_tests.sh`
-- Backend (Actix-web): wiring, middleware, auth, RBAC, domain routes, migrations, logging, tests
-- Frontend (Yew): routing and main pages relevant to the Prompt flows (work orders, recipe steps, map/trail, analytics)
-
 - **Reviewed:** repository structure, README/run docs, backend Actix entrypoints and route registration, config/migrations, auth/RBAC/object-scope logic, sync/merge/retention/notifications/analytics modules, frontend Yew pages/components/routes, and backend/frontend test suites.
 - **Not reviewed:** runtime behavior in browser/server, container orchestration health, actual DB migration execution results, real network/offline conditions, audio/device geolocation behavior in live browsers.
 - **Intentionally not executed:** project startup, Docker, tests, external services.
