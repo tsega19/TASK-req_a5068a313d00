@@ -2,9 +2,7 @@ use actix_web::test::TestRequest;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::common::{
-    auth_header, if_match_header, json_of, make_service, raw_of, setup, status_of, wo_etag,
-};
+use super::common::{auth_header, json_of, make_service, raw_of, setup, status_of};
 
 async fn seed_notification(pool: &sqlx::PgPool, user_id: Uuid) -> Uuid {
     sqlx::query_scalar(
@@ -368,7 +366,6 @@ async fn admin_user_create_emits_signup_success_notification() {
             "username": "onboarded_tech",
             "password": "a-sufficiently-long-password",
             "role": "TECH",
-            "branch_id": ctx.branch_a_id,
         }))
         .to_request();
     let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;
@@ -391,11 +388,9 @@ async fn work_order_cancel_transition_emits_cancellation_to_assigned_tech() {
     let app = make_service(&ctx).await;
     // WO-A is assigned to tech_a. An admin cancels it — the tech must be
     // notified, not the admin who triggered the action.
-    let etag = wo_etag(&ctx.pool, ctx.wo_a_id).await;
     let req = TestRequest::put()
         .uri(&format!("/api/work-orders/{}/state", ctx.wo_a_id))
         .insert_header(auth_header(&ctx.admin_token))
-        .insert_header(if_match_header(&etag))
         .set_json(json!({
             "to_state": "Canceled",
             "notes": "customer rescheduled",

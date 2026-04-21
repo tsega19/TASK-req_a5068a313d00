@@ -53,12 +53,7 @@ async fn admin_user_create_rejects_duplicate_username() {
     let req = TestRequest::post()
         .uri("/api/admin/users")
         .insert_header(auth_header(&ctx.admin_token))
-        .set_json(json!({
-            "username": "admin",
-            "password": "correct-horse-battery-staple",
-            "role": "TECH",
-            "branch_id": ctx.branch_a_id
-        }))
+        .set_json(json!({ "username": "admin", "password": "correct-horse-battery-staple", "role": "TECH" }))
         .to_request();
     assert_eq!(status_of(&app, req).await, 409);
 }

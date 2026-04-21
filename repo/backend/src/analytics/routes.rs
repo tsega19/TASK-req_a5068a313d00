@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::models::Role;
 use crate::errors::ApiError;
-use crate::middleware::rbac::{require_branch, AuthedUser};
+use crate::middleware::rbac::AuthedUser;
 use crate::log_info;
 
 const MODULE: &str = "analytics";
@@ -62,11 +62,10 @@ async fn query_learning(
         .map(|s| s.parse::<Role>().map_err(ApiError::BadRequest))
         .transpose()?;
 
-    // Scope per caller role. Fail-closed for SUPER (audit AR-1 High): a
-    // null-branch SUPER must not leak into the unscoped global query.
+    // Scope per caller role.
     let (scope_user, scope_branch): (Option<Uuid>, Option<Uuid>) = match user.role() {
         Role::Tech => (Some(user.user_id()), None),
-        Role::Super => (None, Some(require_branch(user)?)),
+        Role::Super => (None, user.branch_id()),
         Role::Admin => (None, None),
     };
     // Query-supplied branch filter narrows further, but never widens.
@@ -229,19 +228,17 @@ fn parse_bucket(b: Option<&str>) -> Result<Option<&'static str>, ApiError> {
 fn resolve_scope(
     user: &AuthedUser,
     q_branch: Option<Uuid>,
-) -> Result<(Option<Uuid>, Option<Uuid>), ApiError> {
-    // Fail-closed SUPER scope (audit AR-1 High): a null-branch SUPER must not
-    // fall through to the unscoped path used by ADMIN.
+) -> (Option<Uuid>, Option<Uuid>) {
     let (scope_user, scope_branch) = match user.role() {
         Role::Tech => (Some(user.user_id()), None),
-        Role::Super => (None, Some(require_branch(user)?)),
+        Role::Super => (None, user.branch_id()),
         Role::Admin => (None, None),
     };
     let effective_branch = match (scope_branch, q_branch) {
         (Some(b), _) => Some(b),
         (None, b) => b,
     };
-    Ok((scope_user, effective_branch))
+    (scope_user, effective_branch)
 }
 
 enum TrendGroup {
@@ -259,7 +256,7 @@ async fn query_trends(
     let from = q.from.as_deref().map(parse_mmddyyyy).transpose()?;
     let to = q.to.as_deref().map(parse_mmddyyyy).transpose()?;
     let bucket = parse_bucket(q.bucket.as_deref())?;
-    let (scope_user, effective_branch) = resolve_scope(user, q.branch)?;
+    let (scope_user, effective_branch) = resolve_scope(user, q.branch);
 
     // Each group mode selects a different "group_id" / "group_label" pair and
     // joins the tables needed to compute `completion_rate` per-row.

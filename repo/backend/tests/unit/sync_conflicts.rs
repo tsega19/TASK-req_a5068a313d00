@@ -26,17 +26,10 @@ async fn trigger_reports_zero_conflicts_on_clean_db() {
 async fn trigger_counts_unresolved_conflicts() {
     let pool = fresh().await;
     // Seed one resolved and two unresolved conflict rows.
-    let branch: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO branches (name) VALUES ('B') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     let resolver: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO users (username, password_hash, role, branch_id)
-         VALUES ('super', 'x', 'SUPER', $1) RETURNING id",
+        "INSERT INTO users (username, password_hash, role)
+         VALUES ('super', 'x', 'SUPER') RETURNING id",
     )
-    .bind(branch)
     .fetch_one(&pool)
     .await
     .unwrap();
