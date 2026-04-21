@@ -77,6 +77,19 @@ pub async fn send_json<B: Serialize, T: DeserializeOwned>(
     body: &B,
     auth: &AuthState,
 ) -> Result<T, ApiError> {
+    send_json_with_if_match(method, path, body, auth, None).await
+}
+
+/// Like `send_json`, but attaches an `If-Match` header when one is supplied.
+/// Mutating work-order endpoints require this for PRD §8 optimistic
+/// concurrency (audit-2 High #3).
+pub async fn send_json_with_if_match<B: Serialize, T: DeserializeOwned>(
+    method: Method,
+    path: &str,
+    body: &B,
+    auth: &AuthState,
+    if_match: Option<&str>,
+) -> Result<T, ApiError> {
     let url = format!("{}{}", base(), path);
     let builder = match method {
         Method::POST => Request::post(&url),
@@ -85,8 +98,11 @@ pub async fn send_json<B: Serialize, T: DeserializeOwned>(
         Method::PATCH => Request::patch(&url),
         _ => Request::get(&url),
     };
-    let req = with_auth(builder, auth)
-        .header("Content-Type", "application/json")
+    let mut builder = with_auth(builder, auth).header("Content-Type", "application/json");
+    if let Some(etag) = if_match {
+        builder = builder.header("If-Match", etag);
+    }
+    let req = builder
         .json(body)
         .map_err(|e| ApiError { status: 0, message: e.to_string(), code: "serialize".into() })?;
     let resp = req.send().await.map_err(|e| ApiError {

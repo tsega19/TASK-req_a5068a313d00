@@ -18,6 +18,10 @@ pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    /// `412 Precondition Failed` — raised when an `If-Match` header is
+    /// required and either missing or stale. The resource's current ETag
+    /// is returned so the client can refetch and retry.
+    PreconditionFailed(String),
     Internal(String),
 }
 
@@ -35,6 +39,7 @@ impl fmt::Display for ApiError {
             ApiError::NotFound(m) => write!(f, "{}", m),
             ApiError::BadRequest(m) => write!(f, "{}", m),
             ApiError::Conflict(m) => write!(f, "{}", m),
+            ApiError::PreconditionFailed(m) => write!(f, "{}", m),
             ApiError::Internal(m) => write!(f, "{}", m),
         }
     }
@@ -52,6 +57,7 @@ impl ApiError {
             ApiError::NotFound(_) => "not_found",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Conflict(_) => "conflict",
+            ApiError::PreconditionFailed(_) => "precondition_failed",
             ApiError::Internal(_) => "internal_error",
         }
     }
@@ -65,6 +71,7 @@ impl ResponseError for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -28,12 +28,25 @@ FieldOps is a client/server application. This document is the contract between t
 
 - `WorkOrderRecord`
   - `priority: 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL'`
-  - `state`: one of 7 states (created, assigned, in-progress, paused, completed, cancelled, review).
+  - `state`: one of `'Scheduled' | 'EnRoute' | 'OnSite' | 'InProgress' | 'WaitingOnParts' | 'Completed' | 'Canceled'`
+    (source of truth: [repo/backend/src/enums.rs](repo/backend/src/enums.rs)). `Completed` and
+    `Canceled` are the terminal states; all others are live.
+  - Transitions are strictly role-gated by [repo/backend/src/state_machine.rs](repo/backend/src/state_machine.rs):
+    - `TECH` drives Scheduled → EnRoute → OnSite → InProgress ↔ WaitingOnParts → Completed.
+    - `SUPER` / `ADMIN` may move any live state to `Canceled`.
+    - `InProgress ↔ WaitingOnParts` is the only bidirectional pair; once a work order
+      enters a terminal state the row refuses further transitions.
   - `assigned_tech_id`, `branch_id`, `recipe_id`.
   - `sla_deadline` drives the 75/90/100% alert thresholds.
   - `etag` (SHA-256 hex), `version_count` (monotonic).
+  - `on_call: bool` — automatic routing flag (PRD §7). The backend sets this to
+    `true` on create and on transition when `priority = 'HIGH'` and the SLA
+    deadline is within `ON_CALL_HIGH_PRIORITY_HOURS` (default **4**). Terminal
+    states always clear it. Supervisors read `/api/work-orders/on-call-queue`
+    which returns rows with `on_call = true`.
 - `WorkOrderTransition` — append-only; the row is made immutable by a DB trigger.
-  - `from_state`, `to_state`, `actor_id`, `at`, `required_fields` (JSONB), optional `notes`.
+  - `from_state`, `to_state`, `triggered_by` (user id), `created_at`,
+    `required_fields` (JSONB), optional `notes`.
 
 ### 1.4 Recipes and steps
 
@@ -63,7 +76,10 @@ FieldOps is a client/server application. This document is the contract between t
 ### 1.8 Notifications
 
 - `NotificationRecord`
-  - `template`: enum (e.g. `SLA_WARNING`, `ASSIGNMENT`, `ANNOUNCEMENT`).
+  - `template_type`: enum
+    `'SIGNUP_SUCCESS' | 'SCHEDULE_CHANGE' | 'CANCELLATION' | 'REVIEW_RESULT'`
+    (source of truth: [repo/backend/src/enums.rs](repo/backend/src/enums.rs)).
+    SLA warnings ride on `SCHEDULE_CHANGE` with an `sla_alert` payload key.
   - `retry_count`, `delivered_at?`, `is_unsubscribed`.
 
 ## 2) HTTP API surface
@@ -74,7 +90,7 @@ All routes are prefixed with `/api` and registered in [repo/backend/src/lib.rs](
 |-------------------|-------------------------------------------------------------------------------------|---------------------|
 | `/auth`           | `POST /login`, `POST /logout`, `POST /change-password`                              | Public / self       |
 | `/me`             | `GET /`, `PUT /privacy`, `PUT /home-address`                                        | Self                |
-| `/work-orders`    | CRUD, `POST /{id}/transitions`, `GET /{id}/timeline`, on-call queue                 | TECH (own) / SUPER / ADMIN |
+| `/work-orders`    | CRUD, `PUT /{id}/state`, `GET /{id}/timeline`, `GET /on-call-queue`                 | TECH (own) / SUPER / ADMIN |
 | `/recipes/*`      | `recipes`, `steps`, `tip-cards` (read + manage)                                     | Read: all; Manage: SUPER+ |
 | `/learning/*`     | `knowledge`, `records` (submit + list)                                              | Self; ADMIN sees all |
 | `/analytics`      | `GET /learning` with date filter + CSV export                                       | SUPER (branch) / ADMIN (all) |
@@ -86,7 +102,10 @@ All routes are prefixed with `/api` and registered in [repo/backend/src/lib.rs](
 Common conventions:
 
 - **Pagination**: list endpoints accept `page` and `per_page`; clamped by [pagination.rs](repo/backend/src/pagination.rs) (default **20**, max **200**). Responses use `{ items, page, per_page, total }`.
-- **ETag / If-Match**: work orders and step-progress mutating endpoints require `If-Match: <etag>`; a stale value returns `412 Precondition Failed`.
+- **ETag / If-Match**: work orders and step-progress mutating endpoints require `If-Match: <etag>`; a missing or stale value returns `412 Precondition Failed`. Enforced by
+  [repo/backend/src/work_orders/routes.rs](repo/backend/src/work_orders/routes.rs) and
+  [repo/backend/src/work_orders/progress.rs](repo/backend/src/work_orders/progress.rs).
+  Step-progress upsert only requires the header when a prior row exists (first-time inserts have no ETag to match).
 - **Dates**: ISO-8601 UTC on the wire; analytics input/export uses `MM/DD/YYYY`.
 
 ## 3) Auth API
@@ -143,8 +162,11 @@ Primary modules: [repo/backend/src/work_orders](repo/backend/src/work_orders), [
 
 Key contracts:
 
-- Transitions are validated by the state machine; disallowed transitions return 422 with `required_fields` indicating what is missing.
-- Each successful transition appends a row to `work_order_transitions` (immutable).
+- Transitions are validated by the state machine; disallowed transitions return 400 with `required_fields` indicating what is missing.
+- Each successful transition appends a row to `work_order_transitions` (immutable via DB trigger).
+- Automatic on-call routing runs on every create + transition. When the rule
+  flips the `on_call` flag, a dedicated `work_order.on_call.routed` row is
+  written to `processing_log` so the routing event is individually auditable.
 - Step progress mutations bump `version` and may produce a new entry in `job_step_progress_versions`, subject to the retention cap.
 - Recipe step timers are server-owned; the client renders from the server-stored `timer_state_snapshot` so pause/resume survives disconnects.
 

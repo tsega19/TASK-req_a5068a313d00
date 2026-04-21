@@ -129,7 +129,6 @@ pub fn map_view_page(props: &MapProps) -> Html {
         let posting = posting.clone();
         let reload = reload.clone();
         let id = props.id;
-        let wo_state = wo.clone();
         Callback::from(move |_| {
             if *posting {
                 return;
@@ -139,36 +138,29 @@ pub fn map_view_page(props: &MapProps) -> Html {
             let toasts = toasts.clone();
             let posting = posting.clone();
             let reload = reload.clone();
-            let wo_state = wo_state.clone();
-            // Ask the browser for a real fix first; fall back to a point near the
-            // job location if geolocation is unavailable (offline, denied, or
-            // unsupported). The callback captures the handler state via Rc so a
-            // second call after resolution can toast the correct outcome.
+            // Ask the browser for a real device fix. When geolocation is
+            // unavailable (offline, permission denied, unsupported) we refuse
+            // to record a point — see audit-2 Medium #6. The trail must only
+            // carry device-generated coordinates to preserve "technician's own
+            // recorded trajectory" semantics.
             request_location(move |result| {
                 let state = auth.state.clone();
                 let toasts = toasts.clone();
                 let posting = posting.clone();
                 let reload = reload.clone();
                 let reload_val = *reload;
-                let (lat, lng, source) = match result {
-                    Ok((la, ln)) => (la, ln, "device"),
+                let (lat, lng) = match result {
+                    Ok((la, ln)) => (la, ln),
                     Err(msg) => {
-                        // Offline / permission denied: fall back to the job
-                        // location with small jitter so the trail still
-                        // reflects something plausible. Warn the user so they
-                        // know the captured point is synthetic.
                         toast_err(
                             &toasts,
-                            format!("Geolocation unavailable ({}); using fallback", msg),
+                            format!(
+                                "Geolocation unavailable ({}); trail point not recorded — re-enable location and retry",
+                                msg
+                            ),
                         );
-                        let (la, ln) = wo_state
-                            .as_ref()
-                            .and_then(|w| w.location_lat.zip(w.location_lng))
-                            .map(|(la, ln)| {
-                                (la + fastrand(-0.01, 0.01), ln + fastrand(-0.01, 0.01))
-                            })
-                            .unwrap_or((37.7749, -122.4194));
-                        (la, ln, "fallback")
+                        posting.set(false);
+                        return;
                     }
                 };
                 wasm_bindgen_futures::spawn_local(async move {
@@ -176,12 +168,7 @@ pub fn map_view_page(props: &MapProps) -> Html {
                     let url = format!("/api/work-orders/{}/location-trail", id);
                     match offline::mutate_with_queue(Method::POST, &url, &body, &state).await {
                         Ok(Some(_)) => {
-                            let msg = if source == "device" {
-                                "Trail point recorded from device location"
-                            } else {
-                                "Trail point recorded (offline fallback)"
-                            };
-                            toast_ok(&toasts, msg);
+                            toast_ok(&toasts, "Trail point recorded from device location");
                             reload.set(reload_val + 1);
                         }
                         Ok(None) => {
@@ -253,11 +240,6 @@ pub fn map_view_page(props: &MapProps) -> Html {
 }
 
 /// Tiny deterministic jitter — avoids pulling in the `rand` crate for wasm.
-fn fastrand(min: f64, max: f64) -> f64 {
-    let seed = js_sys::Date::now();
-    let frac = (seed.fract() + seed.sin()).fract().abs();
-    min + frac * (max - min)
-}
 
 /// Request a single high-accuracy fix from `navigator.geolocation`.
 ///
