@@ -77,6 +77,11 @@ services:
       SYNC_INTERVAL_MINUTES: "10"
       DEFAULT_SERVICE_RADIUS_MILES: "30"
       MAX_NOTIFICATIONS_PER_HOUR: "20"
+      # Historical version retention cap applied uniformly to all
+      # entities written to `record_versions` (PRD §7). The legacy
+      # `MAX_VERSIONS_PER_PROGRESS` is still accepted as a fallback
+      # so existing deployments don't silently reset to defaults.
+      MAX_VERSIONS_PER_RECORD: "30"
       MAX_VERSIONS_PER_PROGRESS: "30"
       SOFT_DELETE_RETENTION_DAYS: "90"
       SLA_ALERT_THRESHOLDS: "0.75,0.90,1.00"

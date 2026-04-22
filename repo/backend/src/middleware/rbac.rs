@@ -259,6 +259,25 @@ pub fn require_any_role(user: &AuthedUser, allowed: &[Role]) -> Result<(), ApiEr
     }
 }
 
+/// Fail-closed branch scope for SUPER and TECH principals. Handlers that
+/// derive tenant visibility from `branch_id` call this so a principal with
+/// a null branch cannot slip through the scope predicate and widen into
+/// another team's rows. ADMIN is intentionally exempt — they have global
+/// scope by design.
+pub fn require_branch_scope(user: &AuthedUser) -> Result<uuid::Uuid, ApiError> {
+    match user.role() {
+        Role::Admin => Err(ApiError::Internal(
+            "require_branch_scope called for ADMIN — use a role-specific arm instead".into(),
+        )),
+        Role::Super | Role::Tech => user.branch_id().ok_or_else(|| {
+            ApiError::Forbidden(format!(
+                "{} principal has no branch assignment",
+                user.role()
+            ))
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

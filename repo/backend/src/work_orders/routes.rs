@@ -16,7 +16,7 @@ use crate::errors::ApiError;
 use crate::etag;
 use crate::geo::haversine_miles;
 use crate::location::geocode_stub;
-use crate::middleware::rbac::{require_any_role, AuthedUser};
+use crate::middleware::rbac::{require_any_role, require_branch_scope, AuthedUser};
 use crate::pagination::{PageParams, Paginated};
 use crate::processing_log;
 use crate::state_machine::{allowed_transition, TransitionContext};
@@ -63,10 +63,10 @@ pub async fn list_work_orders(
             (rows, total)
         }
         Role::Super => {
-            let branch = user.branch_id();
+            let branch = require_branch_scope(&user)?;
             let rows = sqlx::query_as::<_, WorkOrder>(
                 "SELECT * FROM work_orders
-                 WHERE deleted_at IS NULL AND ($1::uuid IS NULL OR branch_id = $1)
+                 WHERE deleted_at IS NULL AND branch_id = $1
                  ORDER BY priority DESC, sla_deadline ASC NULLS LAST, created_at DESC
                  OFFSET $2 LIMIT $3",
             )
@@ -77,7 +77,7 @@ pub async fn list_work_orders(
             .await?;
             let total: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM work_orders
-                 WHERE deleted_at IS NULL AND ($1::uuid IS NULL OR branch_id = $1)",
+                 WHERE deleted_at IS NULL AND branch_id = $1",
             )
             .bind(branch)
             .fetch_one(pool.get_ref())
@@ -119,10 +119,10 @@ pub async fn on_call_queue(
     require_any_role(&user, &[Role::Super, Role::Admin])?;
     let hours = cfg.business.on_call_high_priority_hours;
     // PRD supervisor-scope rule: SUPER sees only their own branch; ADMIN is
-    // global. The `$2::uuid IS NULL` arm covers the ADMIN case without a
-    // second query path.
+    // global. The `$2::uuid IS NULL` arm now only triggers for ADMIN —
+    // SUPER must resolve to a concrete branch or be rejected.
     let scope_branch: Option<Uuid> = match user.role() {
-        Role::Super => user.branch_id(),
+        Role::Super => Some(require_branch_scope(&user)?),
         Role::Admin => None,
         Role::Tech => unreachable!("require_any_role above rejects TECH"),
     };
@@ -291,6 +291,21 @@ pub async fn create_work_order(
         }),
     )
     .await?;
+
+    // Write-time automatic dispatch (PRD §7): HIGH/CRITICAL work orders
+    // without an explicit assignee are routed to the best on-call TECH in
+    // the branch inside the same transaction, so creation and assignment
+    // land atomically. No-op for LOW/NORMAL priority or pre-assigned jobs.
+    crate::dispatch::dispatch_on_create_tx(
+        &mut tx,
+        id,
+        req.branch_id,
+        priority,
+        req.assigned_tech_id,
+        Some(user.user_id()),
+    )
+    .await?;
+
     tx.commit().await?;
 
     // Silence the unused-config warning in the unlikely path where radius check
@@ -418,6 +433,22 @@ pub async fn transition_state(
     // Apply transition inside a transaction so the state change and the
     // immutable transition log row land atomically.
     let mut tx = pool.begin().await?;
+
+    // Snapshot the pre-transition work order into the generic per-record
+    // version store (PRD §7). This generalizes historical retention
+    // beyond step progress — the cap is shared across entity types.
+    let pre_snapshot = serde_json::to_value(&wo).unwrap_or(json!({}));
+    crate::versions::snapshot_tx(
+        &mut tx,
+        crate::versions::entities::WORK_ORDERS,
+        id,
+        wo.version_count,
+        pre_snapshot,
+        Some(user.user_id()),
+        cfg.business.max_versions_per_record,
+    )
+    .await?;
+
     let new_etag = etag::from_parts([
         id.to_string(),
         format!("{:?}", req.to_state),
@@ -599,10 +630,13 @@ pub async fn load_visible(
 
     let visible = match user.role() {
         Role::Tech => wo.assigned_tech_id == Some(user.user_id()),
-        Role::Super => match (user.branch_id(), wo.branch_id) {
-            (Some(u_b), Some(wo_b)) => u_b == wo_b,
-            _ => true, // unscoped supers see all branch-less work orders
-        },
+        Role::Super => {
+            // Fail-closed: SUPER must carry a concrete branch, and the WO
+            // must be pinned to the same branch. A null WO branch is NOT
+            // implicitly shared (prior behavior widened scope).
+            let u_b = require_branch_scope(user)?;
+            wo.branch_id == Some(u_b)
+        }
         Role::Admin => true,
     };
     if !visible {

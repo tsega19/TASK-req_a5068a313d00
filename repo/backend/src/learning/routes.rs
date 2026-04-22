@@ -19,7 +19,7 @@ use crate::auth::models::Role;
 use crate::config::AppConfig;
 use crate::errors::ApiError;
 use crate::log_info;
-use crate::middleware::rbac::{require_any_role, require_role, AuthedUser};
+use crate::middleware::rbac::{require_any_role, require_branch_scope, require_role, AuthedUser};
 use crate::processing_log;
 
 const MODULE: &str = "learning";
@@ -451,15 +451,16 @@ pub async fn list_records(
             .await?
         }
         Role::Super => {
+            let branch = require_branch_scope(&user)?;
             sqlx::query_as::<_, LearningRecord>(
                 "SELECT lr.id, lr.user_id, lr.knowledge_point_id, lr.work_order_id,
                         lr.quiz_score, lr.time_spent_seconds, lr.review_count, lr.completed_at
                  FROM learning_records lr
                  JOIN users u ON u.id = lr.user_id
-                 WHERE ($1::uuid IS NULL OR u.branch_id = $1)
+                 WHERE u.branch_id = $1
                  ORDER BY lr.completed_at DESC NULLS LAST",
             )
-            .bind(user.branch_id())
+            .bind(branch)
             .fetch_all(pool.get_ref())
             .await?
         }
@@ -504,17 +505,18 @@ pub async fn get_record(
             }
         }
         Role::Super => {
+            let u_branch = require_branch_scope(&user)?;
             let owner_branch: Option<Uuid> =
                 sqlx::query_scalar("SELECT branch_id FROM users WHERE id = $1")
                     .bind(row.user_id)
                     .fetch_optional(pool.get_ref())
                     .await?
                     .flatten();
-            match (user.branch_id(), owner_branch) {
-                (Some(u), Some(o)) if u != o => {
-                    return Err(ApiError::NotFound("record not found".into()))
-                }
-                _ => {}
+            // Fail-closed: SUPER may only see records owned by users pinned
+            // to the same branch. A null owner_branch is NOT implicitly
+            // shared — this replaces the old "match any None" behavior.
+            if owner_branch != Some(u_branch) {
+                return Err(ApiError::NotFound("record not found".into()));
             }
             require_any_role(&user, &[Role::Super, Role::Admin])?;
         }

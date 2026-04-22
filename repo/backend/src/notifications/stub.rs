@@ -364,7 +364,7 @@ mod tests {
                 sync_interval_minutes: 10,
                 default_service_radius_miles: 30,
                 max_notifications_per_hour: 20,
-                max_versions_per_progress: 30,
+                max_versions_per_record: 30,
                 soft_delete_retention_days: 90,
                 sla_alert_thresholds: vec![],
                 notification_retry_max_attempts: 5,

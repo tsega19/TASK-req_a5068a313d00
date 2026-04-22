@@ -47,6 +47,17 @@ pub mod actions {
     pub const ME_HOME_ADDRESS_SET: &str = "me.home_address.set";
     // Notifications
     pub const NOTIFICATION_UNSUBSCRIBE: &str = "notification.unsubscribe";
+    // Admin-initiated operational actions (PRD §7 audit: every privileged
+    // operator action must land in the immutable log).
+    pub const ADMIN_SYNC_TRIGGER: &str = "admin.sync.trigger";
+    pub const ADMIN_RETENTION_PRUNE: &str = "admin.retention.prune";
+    pub const ADMIN_NOTIFICATIONS_RETRY: &str = "admin.notifications.retry";
+    pub const ADMIN_SLA_SCAN: &str = "admin.sla.scan";
+    // Sync operator actions
+    pub const SYNC_CONFLICT_RESOLVE: &str = "sync.conflict.resolve";
+    pub const SYNC_WO_DELETE_PUSH: &str = "sync.work_order.delete_push";
+    // Automatic dispatch (write-time + periodic reroute, PRD §7).
+    pub const WO_AUTO_DISPATCH: &str = "work_order.auto_dispatch";
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

@@ -101,11 +101,16 @@ pub async fn merge_step_progress(
                 format!("{:?}", incoming.status),
                 incoming.version.to_string(),
             ]);
-            sqlx::query(
+            // RETURNING id so the sync_log write below uses the concrete
+            // progress-row PK — `/api/sync/changes` joins sync_log.entity_id
+            // to `job_step_progress.id`, so binding step_id here was the
+            // cause of the writer/reader entity-key mismatch (PRD §8).
+            let new_row_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO job_step_progress
                     (work_order_id, step_id, status, notes, timer_state_snapshot,
                      etag, version, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 RETURNING id",
             )
             .bind(incoming.work_order_id)
             .bind(incoming.step_id)
@@ -115,9 +120,17 @@ pub async fn merge_step_progress(
             .bind(&etag_v)
             .bind(incoming.version)
             .bind(incoming.updated_at)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-            log_sync(&mut tx, incoming, SyncOperation::Insert, &etag_v, false).await?;
+            log_sync(
+                &mut tx,
+                incoming,
+                new_row_id,
+                SyncOperation::Insert,
+                &etag_v,
+                false,
+            )
+            .await?;
             MergeOutcome::Applied
         }
         Some((row_id, local_status, local_notes, local_timer, local_version, local_updated_at)) => {
@@ -166,7 +179,15 @@ pub async fn merge_step_progress(
                         format!("{:?}", local_status),
                         local_version.to_string(),
                     ]);
-                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, true).await?;
+                    log_sync(
+                        &mut tx,
+                        incoming,
+                        row_id,
+                        SyncOperation::Update,
+                        &etag_v,
+                        true,
+                    )
+                    .await?;
                     MergeOutcome::Conflict
                 }
             }
@@ -208,7 +229,15 @@ pub async fn merge_step_progress(
                         incoming.work_order_id,
                         incoming.step_id
                     );
-                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, true).await?;
+                    log_sync(
+                        &mut tx,
+                        incoming,
+                        row_id,
+                        SyncOperation::Update,
+                        &etag_v,
+                        true,
+                    )
+                    .await?;
                     MergeOutcome::Conflict
                 } else if incoming.updated_at > local_updated_at {
                     // Later-timestamp payload wins deterministically (PRD §8).
@@ -247,7 +276,15 @@ pub async fn merge_step_progress(
                         local_updated_at,
                         incoming.updated_at
                     );
-                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, false).await?;
+                    log_sync(
+                        &mut tx,
+                        incoming,
+                        row_id,
+                        SyncOperation::Update,
+                        &etag_v,
+                        false,
+                    )
+                    .await?;
                     MergeOutcome::Applied
                 } else if incoming.updated_at < local_updated_at {
                     // Strictly older incoming timestamp loses deterministically.
@@ -268,7 +305,15 @@ pub async fn merge_step_progress(
                         incoming.step_id,
                         incoming.updated_at
                     );
-                    log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, true).await?;
+                    log_sync(
+                        &mut tx,
+                        incoming,
+                        row_id,
+                        SyncOperation::Update,
+                        &etag_v,
+                        true,
+                    )
+                    .await?;
                     MergeOutcome::Conflict
                 }
             } else {
@@ -298,7 +343,15 @@ pub async fn merge_step_progress(
                 .bind(row_id)
                 .execute(&mut *tx)
                 .await?;
-                log_sync(&mut tx, incoming, SyncOperation::Update, &etag_v, false).await?;
+                log_sync(
+                    &mut tx,
+                    incoming,
+                    row_id,
+                    SyncOperation::Update,
+                    &etag_v,
+                    false,
+                )
+                .await?;
                 MergeOutcome::Applied
             }
         }
@@ -311,21 +364,32 @@ pub async fn merge_step_progress(
 async fn log_sync(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     incoming: &IncomingProgress,
+    progress_row_id: Uuid,
     op: SyncOperation,
     new_etag: &str,
     conflict: bool,
 ) -> Result<(), ApiError> {
+    // `entity_id` must be the `job_step_progress.id` so readers (SUPER/TECH
+    // scope predicates in /api/sync/changes) can join on `p.id = s.entity_id`.
+    // Binding step_id here was the writer/reader mismatch called out by the
+    // audit: a replica fetching changes would see a sync_log row for step
+    // progress but the join would never resolve, silently dropping the
+    // event from the changes feed.
     sqlx::query(
         "INSERT INTO sync_log
             (entity_table, entity_id, operation, old_etag, new_etag, conflict_flagged)
          VALUES ('job_step_progress', $1, $2, NULL, $3, $4)",
     )
-    .bind(incoming.step_id)
+    .bind(progress_row_id)
     .bind(op)
     .bind(new_etag)
     .bind(conflict)
     .execute(&mut **tx)
     .await?;
+    // Keep `incoming` in the signature so call-sites remain self-documenting
+    // and callers can't accidentally omit the source payload that produced
+    // this sync event.
+    let _ = incoming;
     Ok(())
 }
 
@@ -343,6 +407,33 @@ pub async fn resolve_conflict(
     .bind(resolver)
     .bind(conflict_id)
     .execute(pool)
+    .await?
+    .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound(
+            "conflict not found or already resolved".into(),
+        ));
+    }
+    log_info!(MODULE, "conflict_resolved", "conflict={} by={}", conflict_id, resolver);
+    Ok(())
+}
+
+/// Transactional variant — participates in the caller's transaction so
+/// the resolve update and the audit row written by the caller land
+/// atomically (PRD §7 strict audit guarantee).
+pub async fn resolve_conflict_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conflict_id: Uuid,
+    resolver: Uuid,
+) -> Result<(), ApiError> {
+    let affected = sqlx::query(
+        "UPDATE sync_log
+         SET conflict_resolved_by = $1
+         WHERE id = $2 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
+    )
+    .bind(resolver)
+    .bind(conflict_id)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if affected == 0 {

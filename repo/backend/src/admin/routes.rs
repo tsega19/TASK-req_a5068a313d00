@@ -86,6 +86,16 @@ pub async fn create_user(
             "password must be at least 12 characters".into(),
         ));
     }
+    // Fail-closed tenant isolation (PRD §6): SUPER and TECH must be pinned
+    // to a branch. The DB enforces the same invariant via a CHECK
+    // constraint, but we reject here so the API surfaces a clear 400 with
+    // a specific code rather than a generic "database error".
+    if matches!(req.role, Role::Super | Role::Tech) && req.branch_id.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "{} users require a branch_id",
+            req.role
+        )));
+    }
     let hash = hash_password(&req.password, &cfg.auth)?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, UserRow>(
@@ -168,6 +178,25 @@ pub async fn update_user(
     };
     let password_changed = new_hash.is_some();
     let mut tx = pool.begin().await?;
+    // Fail-closed tenant isolation: if this update would leave the row as
+    // SUPER or TECH without a branch_id, reject before touching the DB so
+    // the API returns a clean 400 instead of tripping the CHECK constraint.
+    let current: Option<(Role, Option<Uuid>)> = sqlx::query_as(
+        "SELECT role, branch_id FROM users WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((current_role, current_branch)) = current {
+        let effective_role = req.role.unwrap_or(current_role);
+        let effective_branch = req.branch_id.or(current_branch);
+        if matches!(effective_role, Role::Super | Role::Tech) && effective_branch.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "{} users require a branch_id",
+                effective_role
+            )));
+        }
+    }
     let row = sqlx::query_as::<_, UserRow>(
         "UPDATE users SET
             password_hash = COALESCE($1, password_hash),
@@ -403,6 +432,24 @@ pub async fn trigger_sync(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = sync::trigger(pool.get_ref()).await?;
+    // PRD §7 audit: record the operator action after the business work
+    // lands. The sync trigger itself is not strictly transactional (it
+    // walks many rows), so we write the audit row in a follow-up tx —
+    // a failure surfaces to the caller as an error so the absence of an
+    // audit row is not silently tolerated.
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_SYNC_TRIGGER,
+        "sync_log",
+        None,
+        serde_json::json!({
+            "conflicts_flagged": report.conflicts_flagged,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "sync_trigger", "actor={} conflicts={}", user.user_id(), report.conflicts_flagged);
     Ok(HttpResponse::Ok().json(report.to_json()))
 }
@@ -415,6 +462,20 @@ pub async fn trigger_retention(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::retention::prune(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_RETENTION_PRUNE,
+        "retention",
+        None,
+        serde_json::json!({
+            "users_pruned": report.users_pruned,
+            "work_orders_pruned": report.work_orders_pruned,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "retention_prune",
@@ -434,6 +495,24 @@ pub async fn trigger_notifications_retry(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::notifications::stub::retry_pending(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_NOTIFICATIONS_RETRY,
+        "notifications",
+        None,
+        serde_json::json!({
+            "scanned": report.scanned,
+            "delivered": report.delivered,
+            "giveup": report.giveup,
+            "skipped_backoff": report.skipped_backoff,
+            "failed_again": report.failed_again,
+            "rate_limited_waiting": report.rate_limited_waiting,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "notifications_retry",
@@ -493,6 +572,21 @@ pub async fn trigger_sla_scan(
 ) -> Result<HttpResponse, ApiError> {
     require_role(&user, Role::Admin)?;
     let report = crate::sla::scan_and_alert(pool.get_ref(), cfg.get_ref()).await?;
+    let mut tx = pool.begin().await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::ADMIN_SLA_SCAN,
+        "work_orders",
+        None,
+        serde_json::json!({
+            "scanned": report.scanned,
+            "alerts_emitted": report.alerts_emitted,
+            "deduped": report.deduped,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(
         MODULE,
         "sla_scan",
@@ -501,6 +595,69 @@ pub async fn trigger_sla_scan(
         report.scanned,
         report.alerts_emitted,
         report.deduped
+    );
+    Ok(HttpResponse::Ok().json(report.to_json()))
+}
+
+// -----------------------------------------------------------------------------
+// Generic per-record version history (PRD §7). Admin read-only surface
+// over the new `record_versions` table so operators can inspect history
+// for any entity the app snapshots, not just step progress.
+// -----------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct RecordVersionsQuery {
+    pub entity_table: String,
+    pub entity_id: Uuid,
+    pub limit: Option<i64>,
+}
+
+#[get("/record-versions")]
+pub async fn list_record_versions(
+    user: AuthedUser,
+    pool: web::Data<PgPool>,
+    q: web::Query<RecordVersionsQuery>,
+) -> Result<HttpResponse, ApiError> {
+    require_role(&user, Role::Admin)?;
+    let q = q.into_inner();
+    let rows = crate::versions::list(
+        pool.get_ref(),
+        &q.entity_table,
+        q.entity_id,
+        q.limit.unwrap_or(30),
+    )
+    .await?;
+    log_info!(
+        MODULE,
+        "record_versions_list",
+        "actor={} entity={}/{} count={}",
+        user.user_id(),
+        q.entity_table,
+        q.entity_id,
+        rows.len()
+    );
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": rows, "total": rows.len() })))
+}
+
+// -----------------------------------------------------------------------------
+// Dispatch reroute trigger — admin ad-hoc runner for the periodic dispatcher.
+// -----------------------------------------------------------------------------
+#[post("/dispatch/scan")]
+pub async fn trigger_dispatch_scan(
+    user: AuthedUser,
+    pool: web::Data<PgPool>,
+    cfg: web::Data<AppConfig>,
+) -> Result<HttpResponse, ApiError> {
+    require_role(&user, Role::Admin)?;
+    let report = crate::dispatch::scan_and_reroute(pool.get_ref(), cfg.get_ref()).await?;
+    log_info!(
+        MODULE,
+        "dispatch_scan",
+        "actor={} scanned={} assigned={} rerouted={} no_tech={}",
+        user.user_id(),
+        report.scanned,
+        report.assigned,
+        report.rerouted,
+        report.no_tech_available
     );
     Ok(HttpResponse::Ok().json(report.to_json()))
 }
@@ -522,4 +679,6 @@ pub fn scope() -> actix_web::Scope {
         .service(trigger_notifications_retry)
         .service(list_processing_log)
         .service(trigger_sla_scan)
+        .service(trigger_dispatch_scan)
+        .service(list_record_versions)
 }

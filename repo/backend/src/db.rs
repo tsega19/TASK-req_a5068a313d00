@@ -113,6 +113,10 @@ pub async fn ping(pool: &PgPool) -> anyhow::Result<()> {
 /// (which are created by the migrations). The `work_order_transitions`
 /// table has an immutable trigger — we TRUNCATE (DDL) which bypasses it.
 pub async fn truncate_all(pool: &PgPool) -> anyhow::Result<()> {
+    // `record_versions` is append-only with a DB trigger that blocks
+    // DELETE/UPDATE. TRUNCATE is a DDL-level wipe and bypasses row-level
+    // triggers, so it's safe here — tests rely on per-suite truncation
+    // to start from a clean slate.
     let stmt = "TRUNCATE TABLE
         notification_unsubscribes,
         notifications,
@@ -122,6 +126,7 @@ pub async fn truncate_all(pool: &PgPool) -> anyhow::Result<()> {
         location_trails,
         job_step_progress_versions,
         job_step_progress,
+        record_versions,
         processing_log,
         work_order_transitions,
         work_orders,

@@ -23,9 +23,10 @@ use uuid::Uuid;
 use crate::auth::models::Role;
 use crate::errors::ApiError;
 use crate::log_info;
-use crate::middleware::rbac::{require_any_role, require_role, AuthedUser};
-use crate::sync::merge::{merge_step_progress, resolve_conflict, IncomingProgress, MergeOutcome};
-use crate::sync::log_soft_delete;
+use crate::middleware::rbac::{require_any_role, require_branch_scope, require_role, AuthedUser};
+use crate::processing_log;
+use crate::sync::merge::{merge_step_progress, resolve_conflict_tx, IncomingProgress, MergeOutcome};
+use crate::sync::log_soft_delete_tx;
 use crate::work_orders::routes::load_visible;
 
 const MODULE: &str = "sync";
@@ -113,7 +114,21 @@ pub async fn post_resolve_conflict(
     if !body.acknowledged {
         return Err(ApiError::BadRequest("acknowledged=true required".into()));
     }
-    resolve_conflict(pool.get_ref(), id, user.user_id()).await?;
+    // PRD §7 strict audit: resolve + audit row must land atomically so an
+    // operator acknowledgement can never be observed without the matching
+    // processing_log entry.
+    let mut tx = pool.begin().await?;
+    resolve_conflict_tx(&mut tx, id, user.user_id()).await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::SYNC_CONFLICT_RESOLVE,
+        "sync_log",
+        Some(id),
+        serde_json::json!({ "acknowledged": true }),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "resolved": true })))
 }
 
@@ -189,39 +204,46 @@ pub async fn list_changes(
         .fetch_all(pool.get_ref())
         .await?,
 
-        Role::Super => sqlx::query_as::<_, ChangeRow>(
-            "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
-                    s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
-             FROM sync_log s
-             WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
-               AND ($2::text IS NULL OR s.entity_table = $2)
-               AND (
-                 s.entity_table IN ('recipes', 'tip_cards')
-                 OR (
-                   s.entity_table = 'work_orders' AND EXISTS (
-                     SELECT 1 FROM work_orders w
-                     WHERE w.id = s.entity_id
-                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
+        Role::Super => {
+            // Fail-closed: SUPER must resolve to a concrete branch, and
+            // sync rows for a null-branch WO are NOT treated as shared
+            // (the old predicate let both null-branch principals AND
+            // null-branch WOs widen visibility — two stacked fail-opens).
+            let branch = require_branch_scope(&user)?;
+            sqlx::query_as::<_, ChangeRow>(
+                "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
+                        s.old_etag, s.new_etag, s.synced_at, s.conflict_flagged
+                 FROM sync_log s
+                 WHERE ($1::timestamptz IS NULL OR s.synced_at > $1)
+                   AND ($2::text IS NULL OR s.entity_table = $2)
+                   AND (
+                     s.entity_table IN ('recipes', 'tip_cards')
+                     OR (
+                       s.entity_table = 'work_orders' AND EXISTS (
+                         SELECT 1 FROM work_orders w
+                         WHERE w.id = s.entity_id
+                           AND w.branch_id = $3
+                       )
+                     )
+                     OR (
+                       s.entity_table = 'job_step_progress' AND EXISTS (
+                         SELECT 1 FROM job_step_progress p
+                         JOIN work_orders w ON w.id = p.work_order_id
+                         WHERE p.id = s.entity_id
+                           AND w.branch_id = $3
+                       )
+                     )
                    )
-                 )
-                 OR (
-                   s.entity_table = 'job_step_progress' AND EXISTS (
-                     SELECT 1 FROM job_step_progress p
-                     JOIN work_orders w ON w.id = p.work_order_id
-                     WHERE p.id = s.entity_id
-                       AND ($3::uuid IS NULL OR w.branch_id IS NULL OR w.branch_id = $3)
-                   )
-                 )
-               )
-             ORDER BY s.synced_at ASC
-             LIMIT $4",
-        )
-        .bind(since)
-        .bind(q.entity.as_deref())
-        .bind(user.branch_id())
-        .bind(limit)
-        .fetch_all(pool.get_ref())
-        .await?,
+                 ORDER BY s.synced_at ASC
+                 LIMIT $4",
+            )
+            .bind(since)
+            .bind(q.entity.as_deref())
+            .bind(branch)
+            .bind(limit)
+            .fetch_all(pool.get_ref())
+            .await?
+        }
 
         Role::Tech => sqlx::query_as::<_, ChangeRow>(
             "SELECT s.id, s.entity_table, s.entity_id, s.operation::text AS operation,
@@ -295,18 +317,32 @@ pub async fn push_work_order_delete(
     // Soft-delete propagation must be ADMIN; matches the live DELETE handler.
     require_role(&user, Role::Admin)?;
     let id = path.into_inner();
+    // Soft-delete + tombstone + audit land in one tx so an operator action
+    // is never observable without the matching processing_log entry
+    // (PRD §7 strict audit).
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE work_orders SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW()
          WHERE id = $1",
     )
     .bind(id)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound("work order not found".into()));
     }
-    log_soft_delete(pool.get_ref(), "work_orders", id).await?;
+    log_soft_delete_tx(&mut tx, "work_orders", id).await?;
+    processing_log::record_tx(
+        &mut tx,
+        Some(user.user_id()),
+        processing_log::actions::SYNC_WO_DELETE_PUSH,
+        "work_orders",
+        Some(id),
+        serde_json::json!({ "soft_delete": true, "source": "sync_push" }),
+    )
+    .await?;
+    tx.commit().await?;
     log_info!(MODULE, "push_delete", "user={} wo={}", user.user_id(), id);
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true, "entity_table": "work_orders", "entity_id": id })))
 }

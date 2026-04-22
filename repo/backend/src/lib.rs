@@ -14,6 +14,7 @@ pub mod analytics;
 pub mod auth;
 pub mod crypto;
 pub mod db;
+pub mod dispatch;
 pub mod enums;
 pub mod errors;
 pub mod etag;
@@ -30,6 +31,7 @@ pub mod retention;
 pub mod sla;
 pub mod state_machine;
 pub mod sync;
+pub mod versions;
 pub mod work_orders;
 
 pub async fn health() -> HttpResponse {
@@ -146,6 +148,33 @@ pub fn spawn_sla_alert_worker(pool: sqlx::PgPool, cfg: config::AppConfig) {
                     r.deduped
                 ),
                 Err(e) => log_error!("boot", "sla_alert", "tick failed: {}", e),
+            }
+        }
+    });
+}
+
+/// Background dispatch worker. Scans near-SLA HIGH/CRITICAL work orders
+/// on a cadence and reroutes them to the best on-call TECH when the
+/// existing assignment (or lack of one) is keeping the job stuck. Runs
+/// every minute so near-SLA routing stays tight against the SLA clock.
+pub fn spawn_dispatch_worker(pool: sqlx::PgPool, cfg: config::AppConfig) {
+    actix_web::rt::spawn(async move {
+        let mut interval =
+            actix_web::rt::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match dispatch::scan_and_reroute(&pool, &cfg).await {
+                Ok(r) => log_info!(
+                    "boot",
+                    "dispatch",
+                    "tick scanned={} assigned={} rerouted={} no_tech={}",
+                    r.scanned,
+                    r.assigned,
+                    r.rerouted,
+                    r.no_tech_available
+                ),
+                Err(e) => log_error!("boot", "dispatch", "tick failed: {}", e),
             }
         }
     });

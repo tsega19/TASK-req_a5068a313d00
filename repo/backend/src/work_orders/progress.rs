@@ -124,16 +124,19 @@ pub async fn upsert_progress(
 
     let row: ProgressRow = match existing {
         Some(prev) => {
-            // Snapshot previous version before overwriting.
+            // Snapshot previous version through the generic per-record
+            // version store (PRD §7). Retention cap is enforced uniformly
+            // across entity types by `versions::snapshot_tx`.
             let snapshot = serde_json::to_value(&prev).unwrap_or(json!({}));
-            sqlx::query(
-                "INSERT INTO job_step_progress_versions (progress_id, snapshot, version)
-                 VALUES ($1, $2, $3)",
+            crate::versions::snapshot_tx(
+                &mut tx,
+                crate::versions::entities::JOB_STEP_PROGRESS,
+                prev.id,
+                prev.version,
+                snapshot,
+                Some(user.user_id()),
+                cfg.business.max_versions_per_record,
             )
-            .bind(prev.id)
-            .bind(&snapshot)
-            .bind(prev.version)
-            .execute(&mut *tx)
             .await?;
 
             let next_version = prev.version + 1;
@@ -157,23 +160,6 @@ pub async fn upsert_progress(
             .bind(next_version)
             .bind(prev.id)
             .fetch_one(&mut *tx)
-            .await?;
-
-            // Enforce version cap (PRD §7, max 30).
-            let cap = cfg.business.max_versions_per_progress as i64;
-            sqlx::query(
-                "DELETE FROM job_step_progress_versions
-                 WHERE progress_id = $1
-                   AND id IN (
-                     SELECT id FROM job_step_progress_versions
-                     WHERE progress_id = $1
-                     ORDER BY version DESC
-                     OFFSET $2
-                   )",
-            )
-            .bind(updated.id)
-            .bind(cap)
-            .execute(&mut *tx)
             .await?;
 
             updated

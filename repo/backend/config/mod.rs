@@ -84,7 +84,11 @@ pub struct BusinessConfig {
     pub sync_interval_minutes: u64,
     pub default_service_radius_miles: i32,
     pub max_notifications_per_hour: u32,
-    pub max_versions_per_progress: u32,
+    /// Cap on per-record historical version retention (PRD §7). Applied
+    /// uniformly across entities written to `record_versions` — not
+    /// step-progress specific. Env var: `MAX_VERSIONS_PER_RECORD`, with
+    /// `MAX_VERSIONS_PER_PROGRESS` accepted as a legacy alias.
+    pub max_versions_per_record: u32,
     pub soft_delete_retention_days: u32,
     pub sla_alert_thresholds: Vec<f64>,
     pub notification_retry_max_attempts: u32,
@@ -237,7 +241,13 @@ impl AppConfig {
                 sync_interval_minutes: parse_num("SYNC_INTERVAL_MINUTES", 10u64)?,
                 default_service_radius_miles: parse_num("DEFAULT_SERVICE_RADIUS_MILES", 30i32)?,
                 max_notifications_per_hour: parse_num("MAX_NOTIFICATIONS_PER_HOUR", 20u32)?,
-                max_versions_per_progress: parse_num("MAX_VERSIONS_PER_PROGRESS", 30u32)?,
+                max_versions_per_record: {
+                    // Honor the generic env var first; fall back to the
+                    // legacy step-progress-specific name so existing
+                    // deployments don't silently switch to the default.
+                    let legacy = parse_num("MAX_VERSIONS_PER_PROGRESS", 30u32)?;
+                    parse_num("MAX_VERSIONS_PER_RECORD", legacy)?
+                },
                 soft_delete_retention_days: parse_num("SOFT_DELETE_RETENTION_DAYS", 90u32)?,
                 sla_alert_thresholds,
                 notification_retry_max_attempts: parse_num("NOTIFICATION_RETRY_MAX_ATTEMPTS", 5u32)?,
@@ -305,7 +315,7 @@ impl AppConfig {
                 sync_interval_minutes: 0,
                 default_service_radius_miles: 30,
                 max_notifications_per_hour: 20,
-                max_versions_per_progress: 30,
+                max_versions_per_record: 30,
                 soft_delete_retention_days: 90,
                 sla_alert_thresholds: vec![0.75, 0.90, 1.00],
                 notification_retry_max_attempts: 5,
