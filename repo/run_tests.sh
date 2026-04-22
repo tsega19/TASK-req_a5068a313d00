@@ -90,12 +90,34 @@ else
     # fixture admin (password hash of "pw"). That row persists in postgres
     # after the tests exit and shadows the docker-compose DEFAULT_ADMIN_PASSWORD
     # because `seed_default_admin` skips when a row with the same username
-    # already exists. Wipe it here so the backend reseeds cleanly and the
-    # e2e smoke can log in as admin/admin123.
-    echo "[run_tests] Wiping test-leftover admin row before e2e boot..."
+    # already exists. A plain DELETE is blocked by the processing_log FK
+    # (and its immutable trigger rejects DELETEs from processing_log too),
+    # so wipe via TRUNCATE CASCADE — DDL bypasses row triggers and chases
+    # FK dependents. Mirrors the table set `db::truncate_all` uses.
+    echo "[run_tests] Wiping test-leftover fixture rows before e2e boot..."
     docker exec fieldops_postgres psql -U fieldops -d fieldops \
         -v ON_ERROR_STOP=0 \
-        -c "DELETE FROM users WHERE username = 'admin';" >/dev/null 2>&1 || true
+        -c "TRUNCATE TABLE
+                notification_unsubscribes,
+                notifications,
+                learning_records,
+                knowledge_points,
+                check_ins,
+                location_trails,
+                job_step_progress_versions,
+                job_step_progress,
+                record_versions,
+                processing_log,
+                work_order_transitions,
+                work_orders,
+                tip_cards,
+                step_timers,
+                recipe_steps,
+                recipes,
+                sync_log,
+                users,
+                branches
+                RESTART IDENTITY CASCADE;" >/dev/null 2>&1 || true
 
     echo "[run_tests] Bringing up full stack for e2e..."
     docker compose up -d --build --force-recreate backend frontend

@@ -366,6 +366,7 @@ async fn admin_user_create_emits_signup_success_notification() {
             "username": "onboarded_tech",
             "password": "a-sufficiently-long-password",
             "role": "TECH",
+            "branch_id": ctx.branch_a_id,
         }))
         .to_request();
     let (status, body): (u16, serde_json::Value) = json_of(&app, req).await;

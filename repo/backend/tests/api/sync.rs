@@ -306,14 +306,19 @@ async fn post_step_progress_flags_conflict_on_equal_version_equal_timestamp_diff
     assert_eq!(body["outcome"], "conflict");
     assert_eq!(body["conflict"], true);
 
-    // sync_log has a flagged row awaiting SUPER review.
+    // sync_log has a flagged row awaiting SUPER review. `entity_id` is the
+    // `job_step_progress.id` (see sync::merge::log_sync comment), so join
+    // through to match on the (work_order_id, step_id) pair the test knows.
     let flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sync_log
-         WHERE entity_table = 'job_step_progress'
-           AND entity_id = $1
-           AND conflict_flagged = TRUE
-           AND conflict_resolved_by IS NULL",
+        "SELECT COUNT(*) FROM sync_log s
+         JOIN job_step_progress p ON p.id = s.entity_id
+         WHERE s.entity_table = 'job_step_progress'
+           AND p.work_order_id = $1
+           AND p.step_id = $2
+           AND s.conflict_flagged = TRUE
+           AND s.conflict_resolved_by IS NULL",
     )
+    .bind(ctx.wo_a_id)
     .bind(step)
     .fetch_one(&ctx.pool)
     .await

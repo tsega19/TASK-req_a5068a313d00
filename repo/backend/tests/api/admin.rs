@@ -50,10 +50,18 @@ async fn admin_user_create_rejects_short_password() {
 async fn admin_user_create_rejects_duplicate_username() {
     let ctx = setup().await;
     let app = make_service(&ctx).await;
+    // branch_id is required for TECH (PRD §6 fail-closed tenant isolation);
+    // supplying it lets the request pass role validation and trip the
+    // duplicate-username check instead of a 400 for the missing branch.
     let req = TestRequest::post()
         .uri("/api/admin/users")
         .insert_header(auth_header(&ctx.admin_token))
-        .set_json(json!({ "username": "admin", "password": "correct-horse-battery-staple", "role": "TECH" }))
+        .set_json(json!({
+            "username": "admin",
+            "password": "correct-horse-battery-staple",
+            "role": "TECH",
+            "branch_id": ctx.branch_a_id,
+        }))
         .to_request();
     assert_eq!(status_of(&app, req).await, 409);
 }

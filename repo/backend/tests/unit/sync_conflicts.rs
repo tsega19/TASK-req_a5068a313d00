@@ -26,10 +26,18 @@ async fn trigger_reports_zero_conflicts_on_clean_db() {
 async fn trigger_counts_unresolved_conflicts() {
     let pool = fresh().await;
     // Seed one resolved and two unresolved conflict rows.
-    let resolver: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO users (username, password_hash, role)
-         VALUES ('super', 'x', 'SUPER') RETURNING id",
+    // SUPER must be pinned to a branch (PRD §6 tenant-isolation check).
+    let branch: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO branches (name, lat, lng) VALUES ('B', 37.0, -122.0) RETURNING id",
     )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let resolver: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, role, branch_id)
+         VALUES ('super', 'x', 'SUPER', $1) RETURNING id",
+    )
+    .bind(branch)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -151,11 +159,15 @@ async fn merge_rejects_overwrite_of_completed_and_flags_conflict() {
     ).bind(wo).bind(step).fetch_one(&pool).await.unwrap();
     assert_eq!(status, "Completed");
 
-    // A flagged conflict landed in sync_log.
+    // A flagged conflict landed in sync_log. `entity_id` is the
+    // `job_step_progress.id` (see sync::merge::log_sync comment); join to
+    // match on (work_order_id, step_id).
     let flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sync_log
-         WHERE entity_id = $1 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
-    ).bind(step).fetch_one(&pool).await.unwrap();
+        "SELECT COUNT(*) FROM sync_log s
+         JOIN job_step_progress p ON p.id = s.entity_id
+         WHERE p.work_order_id = $1 AND p.step_id = $2
+           AND s.conflict_flagged = TRUE AND s.conflict_resolved_by IS NULL",
+    ).bind(wo).bind(step).fetch_one(&pool).await.unwrap();
     assert_eq!(flagged, 1);
 
     // And the original notes are preserved, with the replica's extra appended.
@@ -268,9 +280,11 @@ async fn merge_equal_version_equal_timestamp_conflict_flagged_for_super() {
     };
     assert_eq!(merge_step_progress(&pool, &incoming).await.unwrap(), MergeOutcome::Conflict);
     let flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sync_log
-         WHERE entity_id = $1 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
-    ).bind(step).fetch_one(&pool).await.unwrap();
+        "SELECT COUNT(*) FROM sync_log s
+         JOIN job_step_progress p ON p.id = s.entity_id
+         WHERE p.work_order_id = $1 AND p.step_id = $2
+           AND s.conflict_flagged = TRUE AND s.conflict_resolved_by IS NULL",
+    ).bind(wo).bind(step).fetch_one(&pool).await.unwrap();
     assert_eq!(flagged, 1);
 }
 
@@ -403,9 +417,11 @@ async fn merge_dual_notes_edit_forces_supervisor_review_regardless_of_timestamp(
 
     // sync_log has one flagged, unresolved row awaiting SUPER.
     let flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sync_log
-         WHERE entity_id = $1 AND conflict_flagged = TRUE AND conflict_resolved_by IS NULL",
-    ).bind(step).fetch_one(&pool).await.unwrap();
+        "SELECT COUNT(*) FROM sync_log s
+         JOIN job_step_progress p ON p.id = s.entity_id
+         WHERE p.work_order_id = $1 AND p.step_id = $2
+           AND s.conflict_flagged = TRUE AND s.conflict_resolved_by IS NULL",
+    ).bind(wo).bind(step).fetch_one(&pool).await.unwrap();
     assert_eq!(flagged, 1);
 }
 
